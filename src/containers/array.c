@@ -4,870 +4,406 @@
  */
 
 #include <assert.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <x86intrin.h>
 
 #include "array.h"
+#include "array_util.h"
+
+enum { DEFAULT_INIT_SIZE = 16 };
 
 extern int array_container_cardinality(const array_container_t *array);
+extern bool array_container_nonzero_cardinality(const array_container_t *array);
 extern void array_container_clear(array_container_t *array);
+extern int32_t array_container_serialized_size_in_bytes(int32_t card);
+extern bool array_container_empty(const array_container_t *array);
+extern bool array_container_full(const array_container_t *array);
 
+/* Create a new array with capacity size. Return NULL in case of failure. */
+array_container_t *array_container_create_given_capacity(int32_t size) {
+    array_container_t *container;
 
-enum{DEFAULT_INIT_SIZE = 16};
+    if ((container = malloc(sizeof(array_container_t))) == NULL) {
+        return NULL;
+    }
 
+    if ((container->array = malloc(sizeof(uint16_t) * size)) == NULL) {
+        free(container);
+        return NULL;
+    }
 
+    container->capacity = size;
+    container->cardinality = 0;
 
+    return container;
+}
 
 /* Create a new array. Return NULL in case of failure. */
 array_container_t *array_container_create() {
-	array_container_t * arr;
-	/* Allocate the array container itself. */
-
-	if ((arr = malloc(sizeof(array_container_t))) == NULL) {
-				return NULL;
-	}
-	if ((arr->array = malloc(sizeof(uint16_t) * DEFAULT_INIT_SIZE)) == NULL) {
-		        free(arr);
-				return NULL;
-	}
-	arr->capacity = DEFAULT_INIT_SIZE;
-	arr->cardinality = 0;
-	return arr;
+    return array_container_create_given_capacity(DEFAULT_INIT_SIZE);
 }
 
+/* Duplicate container */
+array_container_t *array_container_clone(array_container_t *src) {
+    array_container_t *new =
+        array_container_create_given_capacity(src->capacity);
+    if (new == NULL) return NULL;
+
+    new->cardinality = src->cardinality;
+
+    memcpy(new->array, src->array, src->cardinality * sizeof(uint16_t));
+
+    return new;
+}
 
 /* Free memory. */
 void array_container_free(array_container_t *arr) {
-	free(arr->array);
-	arr->array = NULL;
-	free(arr);
+    free(arr->array);
+    arr->array = NULL;
+    free(arr);
 }
 
-
-#define BRANCHLESSBINSEARCH // optimization (branchless with prefetching tends to be fast!)
-
-#ifdef BRANCHLESSBINSEARCH
-
-
-/**
-* the branchless approach is inspired by 
-*  Array layouts for comparison-based searching
-*  http://arxiv.org/pdf/1509.05053.pdf
-*/
-// could potentially use SIMD-based bin. search
-static int32_t binarySearch(uint16_t* source, int32_t n, uint16_t target) {
-	uint16_t * base = source;
-    if(n == 0) return -1;
-    if(target > source[n-1]) return - n - 1;// without this we have a buffer overrun
-    while(n>1) {
-    	int32_t half = n >> 1;
-        __builtin_prefetch(base+(half>>1),0,0);
-        __builtin_prefetch(base+half+(half>>1),0,0);
-        base = (base[half] < target) ? &base[half] : base;
-        n -= half;
-    }
-    // todo: over last cache line, you can just scan or use SIMD instructions
-    base += *base < target;
-    return *base == target ? base - source : source - base -1;
+static inline int32_t grow_capacity(int32_t capacity) {
+    return (capacity <= 0) ? DEFAULT_INIT_SIZE
+                           : capacity < 64 ? capacity * 2
+                                           : capacity < 1024 ? capacity * 3 / 2
+                                                             : capacity * 5 / 4;
 }
 
-
-#else
-
-// good old bin. search ending with a sequential search
-// could potentially use SIMD-based bin. search
-static int32_t binarySearch(uint16_t * array, int32_t lenarray, uint16_t ikey )  {
-	int32_t low = 0;
-	int32_t high = lenarray - 1;
-	while( low+16 <= high) {
-		int32_t middleIndex = (low+high) >> 1;
-		int32_t middleValue = array[middleIndex];
-		if (middleValue < ikey) {
-			low = middleIndex + 1;
-		} else if (middleValue > ikey) {
-			high = middleIndex - 1;
-		} else {
-			return middleIndex;
-		}
-	}
-	for (; low <= high; low++) {
-		uint16_t val = array[low];
-		if (val >= ikey) {
-			if (val == ikey) {
-				return low;
-			}
-			break;
-		}
-	}
-	return -(low + 1);
+static inline int32_t clamp(int32_t val, int32_t min, int32_t max) {
+    return ((val < min) ? min : (val > max) ? max : val);
 }
-
-#endif
 
 /**
  * increase capacity to at least min, and to no more than max. Whether the
- * existing data needs to be copied over depends on copy. If copy is false,
- * then the new content might be uninitialized.
+ * existing data needs to be copied over depends on the "preserve" parameter. If
+ * preserve is false,
+ * then the new content will be uninitialized, otherwise the old content is
+ * copie.
  */
-static void increaseCapacity(array_container_t *arr, int32_t min, int32_t max, bool copy) {
-    int32_t newCapacity = (arr->capacity == 0) ? DEFAULT_INIT_SIZE :
-    		arr->capacity < 64 ? arr->capacity * 2
-            : arr->capacity < 1024 ? arr->capacity * 3 / 2
-            : arr->capacity * 5 / 4;
-    if(newCapacity < min) newCapacity = min;
-    // never allocate more than we will ever need
-    if (newCapacity > max)
-        newCapacity = max;
-    // if we are within 1/16th of the max, go to max
-    if( newCapacity < max - max/16)
-        newCapacity = max;
-    arr->capacity = newCapacity;
-    if(copy)
-      arr->array = realloc(arr->array,arr->capacity) ;
-    else {
-      free(arr->array);
-      arr->array = malloc(arr->capacity) ;
-    }
-    // TODO: handle the case where realloc fails
-    if(arr->array == NULL) {
-    	printf("Well, that's unfortunate. Did I say you could use this code in production?\n");
-    }
-}
+void array_container_grow(array_container_t *container, int32_t min,
+                          int32_t max, bool preserve) {
+    int32_t new_capacity = clamp(grow_capacity(container->capacity), min, max);
 
+    // currently uses set max to INT32_MAX.  The next statement is not so useful
+    // then.
+    // if we are within 1/16th of the max, go to max
+    if (new_capacity > max - max / 16) new_capacity = max;
+
+    container->capacity = new_capacity;
+    uint16_t *array = container->array;
+
+    if (preserve) {
+        container->array = realloc(array, new_capacity * sizeof(uint16_t));
+        if (container->array == NULL) free(array);
+    } else {
+        free(array);
+        container->array = malloc(new_capacity * sizeof(uint16_t));
+    }
+
+    // TODO: handle the case where realloc fails
+    assert(container->array != NULL);
+}
 
 /* Copy one container into another. We assume that they are distinct. */
-void array_container_copy(array_container_t *source, array_container_t *dest) {
-	if(source->cardinality < dest->capacity) {
-		increaseCapacity(dest,source->cardinality,INT32_MAX, false);
-	}
-	dest->cardinality = source->cardinality;
-	memcpy(dest->array,source->array,sizeof(uint16_t)*source->cardinality);
+void array_container_copy(const array_container_t *src,
+                          array_container_t *dst) {
+    const int32_t cardinality = src->cardinality;
+    if (cardinality < dst->capacity) {
+        array_container_grow(dst, cardinality, INT32_MAX, false);
+    }
 
+    dst->cardinality = cardinality;
+    memcpy(dst->array, src->array, cardinality * sizeof(uint16_t));
 }
 
+static void array_container_append(array_container_t *arr, uint16_t pos) {
+    const int32_t capacity = arr->capacity;
 
-static void append(array_container_t *arr, uint16_t i) {
-	if(arr->cardinality == arr->capacity) increaseCapacity(arr,arr->capacity+1,INT32_MAX, true);
-	arr->array[arr->cardinality] = i;
-	arr->cardinality++;
+    if (array_container_full(arr)) {
+        array_container_grow(arr, capacity + 1, INT32_MAX, true);
+    }
+
+    arr->array[arr->cardinality++] = pos;
 }
 
 /* Add x to the set. Returns true if x was not already present.  */
-bool array_container_add(array_container_t *arr, uint16_t x) {
-	if (( (arr->cardinality > 0) && (arr->array[arr->cardinality-1] < x)) || (arr->cardinality == 0)) {
-		append(arr, x);
-		return true;
-	}
+bool array_container_add(array_container_t *arr, uint16_t pos) {
+    const int32_t cardinality = arr->cardinality;
 
-	int32_t loc = binarySearch(arr->array,arr->cardinality, x);
-	if (loc < 0) {// not already present
-		if(arr->capacity == arr->capacity) increaseCapacity(arr,arr->capacity+1,INT32_MAX,true);
-		int32_t i = -loc - 1;
-		memmove(arr->array + i + 1,arr->array + i,(arr->cardinality - i)*sizeof(uint16_t));
-		arr->array[i] = x;
-		arr->cardinality ++;
-		return true;
-	} else return false;
+    // best case, we can append.
+    if (array_container_empty(arr) || (arr->array[cardinality - 1] < pos)) {
+        array_container_append(arr, pos);
+        return true;
+    }
+
+    const int32_t loc = binarySearch(arr->array, cardinality, pos);
+    const bool not_found = loc < 0;
+
+    if (not_found) {
+        if (array_container_full(arr)) {
+            array_container_grow(arr, arr->capacity + 1, INT32_MAX, true);
+        }
+        const int32_t insert_idx = -loc - 1;
+        memmove(arr->array + insert_idx + 1, arr->array + insert_idx,
+                (cardinality - insert_idx) * sizeof(uint16_t));
+        arr->array[insert_idx] = pos;
+        arr->cardinality++;
+    }
+
+    return not_found;
 }
 
 /* Remove x from the set. Returns true if x was present.  */
-bool array_container_remove(array_container_t *arr, uint16_t x) {
-	int32_t loc = binarySearch(arr->array,arr->cardinality, x);
-	if (loc >= 0) {
-		memmove(arr->array + loc ,arr->array + loc + 1,(arr->cardinality - loc) * sizeof(uint16_t));
-		arr->cardinality --;
-		return true;
-	} else return false;
+bool array_container_remove(array_container_t *arr, uint16_t pos) {
+    const int32_t idx = binarySearch(arr->array, arr->cardinality, pos);
+    const bool is_present = idx >= 0;
+    if (is_present) {
+        memmove(arr->array + idx, arr->array + idx + 1,
+                (arr->cardinality - idx) * sizeof(uint16_t));
+        arr->cardinality--;
+    }
+
+    return is_present;
 }
 
 /* Check whether x is present.  */
-bool array_container_contains(const array_container_t *arr, uint16_t x) {
-	int32_t loc = binarySearch(arr->array,arr->cardinality,x);
-	return loc >= 0; // could possibly be faster...
+bool array_container_contains(const array_container_t *arr, uint16_t pos) {
+    return binarySearch(arr->array, arr->cardinality, pos) >= 0;
 }
-
-
-
-// TODO: can one vectorize the computation of the union?
-static int32_t union2by2(uint16_t * set1, int32_t lenset1,
-		uint16_t * set2, int32_t lenset2, uint16_t * buffer){
-	int32_t pos = 0;
-	int32_t k1 = 0;
-	int32_t k2 = 0;
-	if (0 == lenset2) {
-		memcpy(buffer,set1,lenset1*sizeof(uint16_t));// is this safe if buffer is set1 or set2?
-		return lenset1;
-	}
-	if (0 == lenset1) {
-		memcpy(buffer,set2,lenset2*sizeof(uint16_t));// is this safe if buffer is set1 or set2?
-		return lenset2;
-	}
-	uint16_t s1 = set1[k1];
-	uint16_t s2 = set2[k2];
-	while(1) {
-		if (s1 < s2) {
-			buffer[pos] = s1;
-			pos++;
-			k1++;
-			if (k1 >= lenset1) {
-				memcpy(buffer + pos,set2 + k2,(lenset2-k2)*sizeof(uint16_t));// is this safe if buffer is set1 or set2?
-				pos += lenset2 - k2;
-				break;
-			}
-			s1 = set1[k1];
-		} else if (s1 == s2) {
-			buffer[pos] = s1;
-			pos++;
-			k1++;
-			k2++;
-			if (k1 >= lenset1) {
-				memcpy(buffer + pos,set2 + k2,(lenset2-k2)*sizeof(uint16_t));// is this safe if buffer is set1 or set2?
-				pos += lenset2 - k2;
-				break;
-			}
-			if (k2 >= lenset2) {
-				memcpy(buffer + pos,set1 + k1,(lenset1-k1)*sizeof(uint16_t));// is this safe if buffer is set1 or set2?
-				pos += lenset1 - k1;
-				break;
-			}
-			s1 = set1[k1];
-			s2 = set2[k2];
-		} else { // if (set1[k1]>set2[k2])
-			buffer[pos] = s2;
-			pos++;
-			k2++;
-			if (k2 >= lenset2) {
-				// should be memcpy
-				memcpy(buffer + pos,set1 + k1,(lenset1-k1)*sizeof(uint16_t));// is this safe if buffer is set1 or set2?
-				pos += lenset1 - k1;
-				break;
-			}
-			s2 = set2[k2];
-		}
-	}
-	return pos;
-}
-
-
-
-
 
 /* Computes the union of array1 and array2 and write the result to arrayout.
  * It is assumed that arrayout is distinct from both array1 and array2.
  */
-void array_container_union(const array_container_t *array1,
-                        const array_container_t *array2,
-                        array_container_t *arrayout) {
-	int32_t totc = array1->cardinality +  array2->cardinality ;
-	if(arrayout->capacity < totc)
-		increaseCapacity(arrayout,totc,INT32_MAX,false);
-	arrayout->cardinality =  union2by2(array1->array, array1->cardinality,
-			array2->array, array2->cardinality, arrayout->array);
-}
+void array_container_union(const array_container_t *array_1,
+                           const array_container_t *array_2,
+                           array_container_t *out) {
+    const int32_t card_1 = array_1->cardinality, card_2 = array_2->cardinality;
+    const int32_t max_cardinality = card_1 + card_2;
 
+    if (out->capacity < max_cardinality)
+        array_container_grow(out, max_cardinality, INT32_MAX, false);
 
-
-
-int32_t advanceUntil(
-		uint16_t * array,
-		int32_t pos,
-		int32_t length,
-		uint16_t min)  {
-	int32_t lower = pos + 1;
-
-	if ((lower >= length) || (array[lower] >= min)) {
-		return lower;
-	}
-
-	int32_t spansize = 1;
-
-	while ((lower+spansize < length) && (array[lower+spansize] < min)) {
-		spansize <<= 1;
-	}
-	int32_t upper = (lower+spansize < length )?lower + spansize:length - 1;
-
-	if (array[upper] == min) {
-		return upper;
-	}
-
-	if (array[upper] < min) {
-		// means
-		// array
-		// has no
-		// item
-		// >= min
-		// pos = array.length;
-		return length;
-	}
-
-	// we know that the next-smallest span was too small
-	lower += (spansize >> 1);
-
-	int32_t mid = 0;
-	while( lower+1 != upper) {
-		mid = (lower + upper) >> 1;
-		if (array[mid] == min) {
-			return mid;
-		} else if (array[mid] < min) {
-			lower = mid;
-		} else {
-			upper = mid;
-		}
-	}
-	return upper;
-
-}
-
-int32_t onesidedgallopingintersect2by2(
-		uint16_t * smallset, int32_t lensmallset,
-		uint16_t * largeset, int32_t lenlargeset,	uint16_t * buffer)  {
-
-	if( 0 == lensmallset) {
-		return 0;
-	}
-	int32_t k1 = 0;
-	int32_t k2 = 0;
-	int32_t pos = 0;
-	uint16_t s1 = largeset[k1];
-	uint16_t s2 = smallset[k2];
-    while(true) {
-		if (s1 < s2) {
-			k1 = advanceUntil(largeset, k1, lenlargeset, s2);
-			if (k1 == lenlargeset) {
-				break;
-			}
-			s1 = largeset[k1];
-		}
-		if (s2 < s1) {
-			k2++;
-			if (k2 == lensmallset) {
-				break;
-			}
-			s2 = smallset[k2];
-		} else {
-
-			buffer[pos] = s2;
-			pos++;
-			k2++;
-			if (k2 == lensmallset) {
-				break;
-			}
-			s2 = smallset[k2];
-			k1 = advanceUntil(largeset, k1, lenlargeset, s2);
-			if (k1 == lenlargeset) {
-				break;
-			}
-			s1 = largeset[k1];
-		}
-
-	}
-	return pos;
-}
-
-int32_t match_scalar(const uint16_t *A, const int32_t lenA,
-                    const uint16_t *B, const int32_t lenB,
-                    uint16_t *out) {
-
-    const uint16_t *initout = out;
-    if (lenA == 0 || lenB == 0) return 0;
-
-    const uint16_t *endA = A + lenA;
-    const uint16_t *endB = B + lenB;
-
-    while (1) {
-        while (*A < *B) {
-SKIP_FIRST_COMPARE:
-            if (++A == endA) goto FINISH;
-        }
-        while (*A > *B) {
-            if (++B == endB) goto FINISH;
-        }
-        if (*A == *B) {
-            *out++ = *A;
-            if (++A == endA || ++B == endB) goto FINISH;
-        } else {
-            goto SKIP_FIRST_COMPARE;
-        }
+    // compute union with smallest array first
+    if (card_1 < card_2) {
+        out->cardinality = union_uint16(array_1->array, card_1, array_2->array,
+                                        card_2, out->array);
+    } else {
+        out->cardinality = union_uint16(array_2->array, card_2, array_1->array,
+                                        card_1, out->array);
     }
-
-FINISH:
-    return (out - initout);
 }
 
-
-
-
-#ifdef USEAVX
-
-// used by intersect_vector16
-static const uint8_t shuffle_mask16[] __attribute__((aligned(0x1000))) = { -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, 4, 5, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 4, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 2, 3, 4, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 6, 7, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 6,
-		7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, -1,
-		-1, -1, -1, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, 2, 3, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0,
-		1, 2, 3, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 8, 9, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 8, 9, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 8, 9, -1, -1, -1, -1, -1, -1, -1,
-		-1, 6, 7, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6,
-		7, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, -1, -1, -1,
-		-1, -1, -1, -1, -1, 4, 5, 6, 7, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, 0, 1, 4, 5, 6, 7, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4,
-		5, 6, 7, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7,
-		8, 9, -1, -1, -1, -1, -1, -1, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, 2, 3, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, 0, 1, 2, 3, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 4,
-		5, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5,
-		10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 10, 11, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 10, 11, -1, -1,
-		-1, -1, -1, -1, -1, -1, 6, 7, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, 0, 1, 6, 7, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, 2, 3, 6, 7, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2,
-		3, 6, 7, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7, 10, 11, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6, 7, 10, 11, -1, -1,
-		-1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 10, 11, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, -1, -1, -1, -1, -1, -1, 8,
-		9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 8, 9,
-		10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 8, 9, 10, 11, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 8, 9, 10, 11, -1, -1,
-		-1, -1, -1, -1, -1, -1, 4, 5, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 4, 5, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 2,
-		3, 4, 5, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
-		8, 9, 10, 11, -1, -1, -1, -1, -1, -1, 6, 7, 8, 9, 10, 11, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1,
-		-1, -1, -1, -1, 2, 3, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1,
-		-1, 0, 1, 2, 3, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7,
-		8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6, 7, 8, 9,
-		10, 11, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1,
-		-1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1, -1, -1,
-		12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1,
-		12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 12, 13,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 12, 13, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 12, 13, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 12, 13, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, 2, 3, 4, 5, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, 0, 1, 2, 3, 4, 5, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 6, 7, 12,
-		13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 12, 13,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 12, 13, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 12, 13, -1, -1, -1, -1,
-		-1, -1, -1, -1, 4, 5, 6, 7, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, 0, 1, 4, 5, 6, 7, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4,
-		5, 6, 7, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7,
-		12, 13, -1, -1, -1, -1, -1, -1, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 2, 3, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 2, 3, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 8, 9,
-		12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, 12,
-		13, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 8, 9, 12, 13, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1,
-		-1, -1, 6, 7, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0,
-		1, 6, 7, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9,
-		12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, 12, 13,
-		-1, -1, -1, -1, -1, -1, 4, 5, 6, 7, 8, 9, 12, 13, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 4, 5, 6, 7, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, 2,
-		3, 4, 5, 6, 7, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
-		6, 7, 8, 9, 12, 13, -1, -1, -1, -1, 10, 11, 12, 13, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, 0, 1, 10, 11, 12, 13, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 2, 3, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 2, 3, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1,
-		4, 5, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4,
-		5, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 10, 11,
-		12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 10, 11, 12,
-		13, -1, -1, -1, -1, -1, -1, 6, 7, 10, 11, 12, 13, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 6, 7, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1,
-		-1, -1, 2, 3, 6, 7, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0,
-		1, 2, 3, 6, 7, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7, 10,
-		11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6, 7, 10, 11,
-		12, 13, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, -1,
-		-1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, -1, -1, -1,
-		-1, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1,
-		8, 9, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 8, 9, 10,
-		11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 8, 9, 10, 11,
-		12, 13, -1, -1, -1, -1, -1, -1, 4, 5, 8, 9, 10, 11, 12, 13, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1,
-		-1, -1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, 0, 1,
-		2, 3, 4, 5, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, 6, 7, 8, 9, 10, 11,
-		12, 13, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 8, 9, 10, 11, 12,
-		13, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, -1, -1,
-		-1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1,
-		4, 5, 6, 7, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6,
-		7, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-		12, 13, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-		-1, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 14,
-		15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 14, 15,
-		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 14, 15, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 2, 3, 4, 5, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, 0, 1, 2, 3, 4, 5, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 6, 7,
-		14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 14,
-		15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 14, 15, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 14, 15, -1, -1, -1,
-		-1, -1, -1, -1, -1, 4, 5, 6, 7, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, 0, 1, 4, 5, 6, 7, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3,
-		4, 5, 6, 7, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6,
-		7, 14, 15, -1, -1, -1, -1, -1, -1, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 2, 3, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 2, 3, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 8, 9,
-		14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, 14,
-		15, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 8, 9, 14, 15, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 8, 9, 14, 15, -1, -1, -1, -1,
-		-1, -1, 6, 7, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0,
-		1, 6, 7, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9,
-		14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, 14, 15,
-		-1, -1, -1, -1, -1, -1, 4, 5, 6, 7, 8, 9, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 4, 5, 6, 7, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, 2,
-		3, 4, 5, 6, 7, 8, 9, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
-		6, 7, 8, 9, 14, 15, -1, -1, -1, -1, 10, 11, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, 0, 1, 10, 11, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 2, 3, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 2, 3, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1,
-		4, 5, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4,
-		5, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 10, 11,
-		14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 10, 11, 14,
-		15, -1, -1, -1, -1, -1, -1, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1,
-		-1, -1, 2, 3, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0,
-		1, 2, 3, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7, 10,
-		11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6, 7, 10, 11,
-		14, 15, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 10, 11, 14, 15, -1,
-		-1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 14, 15, -1, -1, -1,
-		-1, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1,
-		8, 9, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 8, 9, 10,
-		11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 8, 9, 10, 11,
-		14, 15, -1, -1, -1, -1, -1, -1, 4, 5, 8, 9, 10, 11, 14, 15, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1,
-		-1, -1, 2, 3, 4, 5, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1,
-		2, 3, 4, 5, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1, 6, 7, 8, 9, 10, 11,
-		14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 8, 9, 10, 11, 14,
-		15, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9, 10, 11, 14, 15, -1, -1,
-		-1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1,
-		4, 5, 6, 7, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6,
-		7, 8, 9, 10, 11, 14, 15, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-		14, 15, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15,
-		-1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 12,
-		13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 12, 13,
-		14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 12, 13, 14, 15, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 12, 13, 14, 15, -1, -1, -1,
-		-1, -1, -1, -1, -1, 2, 3, 4, 5, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1,
-		-1, -1, 0, 1, 2, 3, 4, 5, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 6, 7,
-		12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 12,
-		13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 12, 13, 14, 15,
-		-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 12, 13, 14, 15, -1,
-		-1, -1, -1, -1, -1, 4, 5, 6, 7, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1,
-		-1, -1, 0, 1, 4, 5, 6, 7, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 2, 3,
-		4, 5, 6, 7, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6,
-		7, 12, 13, 14, 15, -1, -1, -1, -1, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, 0, 1, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, 2, 3, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1,
-		0, 1, 2, 3, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 4, 5, 8, 9,
-		12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, 12,
-		13, 14, 15, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 8, 9, 12, 13, 14, 15,
-		-1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 8, 9, 12, 13, 14, 15, -1, -1,
-		-1, -1, 6, 7, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0,
-		1, 6, 7, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9,
-		12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, 12, 13,
-		14, 15, -1, -1, -1, -1, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, -1, -1, -1,
-		-1, -1, -1, 0, 1, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, 2,
-		3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
-		6, 7, 8, 9, 12, 13, 14, 15, -1, -1, 10, 11, 12, 13, 14, 15, -1, -1, -1,
-		-1, -1, -1, -1, -1, -1, -1, 0, 1, 10, 11, 12, 13, 14, 15, -1, -1, -1,
-		-1, -1, -1, -1, -1, 2, 3, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1,
-		-1, -1, -1, 0, 1, 2, 3, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1,
-		4, 5, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 4,
-		5, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 2, 3, 4, 5, 10, 11,
-		12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 10, 11, 12,
-		13, 14, 15, -1, -1, -1, -1, 6, 7, 10, 11, 12, 13, 14, 15, -1, -1, -1,
-		-1, -1, -1, -1, -1, 0, 1, 6, 7, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1,
-		-1, -1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0,
-		1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, 4, 5, 6, 7, 10,
-		11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 4, 5, 6, 7, 10, 11,
-		12, 13, 14, 15, -1, -1, -1, -1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14,
-		15, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, -1,
-		-1, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1,
-		8, 9, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 2, 3, 8, 9, 10,
-		11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 8, 9, 10, 11,
-		12, 13, 14, 15, -1, -1, -1, -1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, -1,
-		-1, -1, -1, -1, -1, 0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1,
-		-1, -1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, 0, 1,
-		2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1, 6, 7, 8, 9, 10, 11,
-		12, 13, 14, 15, -1, -1, -1, -1, -1, -1, 0, 1, 6, 7, 8, 9, 10, 11, 12,
-		13, 14, 15, -1, -1, -1, -1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-		-1, -1, -1, -1, 0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1,
-		4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, 0, 1, 4, 5, 6,
-		7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-		12, 13, 14, 15, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-		14, 15 };
-
-/**
- * From Schlegel et al., Fast Sorted-Set Intersection using SIMD Instructions
- *
- * Optimized by D. Lemire on May 3rd 2013
- *
- * Question: Can this benefit from AVX?
- */
-static int32_t intersect_vector16(const uint16_t *A, int32_t s_a,
-		const uint16_t *B, int32_t s_b, uint16_t * C) {
-	int32_t count = 0;
-	int32_t i_a = 0, i_b = 0;
-
-	const int32_t st_a = (s_a / 8) * 8;
-	const int32_t st_b = (s_b / 8) * 8;
-	__m128i v_a, v_b;
-	if ((i_a < st_a) && (i_b < st_b)) {
-		v_a = _mm_lddqu_si128((__m128i *) &A[i_a]);
-		v_b = _mm_lddqu_si128((__m128i *) &B[i_b]);
-		while ((A[i_a] == 0) || (B[i_b] == 0)) {
-			const __m128i res_v = _mm_cmpestrm(v_b, 8, v_a, 8,
-					_SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK);
-			const int r = _mm_extract_epi32(res_v, 0);
-			__m128i sm16 = _mm_load_si128((const __m128i *) shuffle_mask16 + r);
-			__m128i p = _mm_shuffle_epi8(v_a, sm16);
-			_mm_storeu_si128((__m128i *) &C[count], p);
-			count += _mm_popcnt_u32(r);
-			const uint16_t a_max = A[i_a + 7];
-			const uint16_t b_max = B[i_b + 7];
-			if (a_max <= b_max) {
-				i_a += 8;
-				if (i_a == st_a)
-					break;
-				v_a = _mm_lddqu_si128((__m128i *) &A[i_a]);
-
-			}
-			if (b_max <= a_max) {
-				i_b += 8;
-				if (i_b == st_b)
-					break;
-				v_b = _mm_lddqu_si128((__m128i *) &B[i_b]);
-
-			}
-		}
-		if ((i_a < st_a) && (i_b < st_b))
-			while (true) {
-				const __m128i res_v = _mm_cmpistrm(v_b, v_a,
-						_SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK);
-				const int r = _mm_extract_epi32(res_v, 0);
-				__m128i sm16 = _mm_load_si128(
-						(const __m128i *) shuffle_mask16 + r);
-				__m128i p = _mm_shuffle_epi8(v_a, sm16);
-				_mm_storeu_si128((__m128i *) &C[count], p);
-				count += _mm_popcnt_u32(r);
-				const uint16_t a_max = A[i_a + 7];
-				const uint16_t b_max = B[i_b + 7];
-				if (a_max <= b_max) {
-					i_a += 8;
-					if (i_a == st_a)
-						break;
-					v_a = _mm_lddqu_si128((__m128i *) &A[i_a]);
-
-				}
-				if (b_max <= a_max) {
-					i_b += 8;
-					if (i_b == st_b)
-						break;
-					v_b = _mm_lddqu_si128((__m128i *) &B[i_b]);
-
-				}
-			}
-	}
-	// intersect the tail using scalar intersection
-	while (i_a < s_a && i_b < s_b) {
-		int16_t a = A[i_a];
-		int16_t b = B[i_b];
-		if (a < b) {
-			i_a++;
-		} else if (b < a) {
-			i_b++;
-		} else {
-			C[count] = a;		//==b;
-			count++;
-			i_a++;
-			i_b++;
-		}
-	}
-
-	return count;
-}
-
-
-
-/*
- *
- * Useless crap kept around temporarily
-
-static int32_t intersectV1avx_vector16(const uint16_t *A, const int32_t s_a, const uint16_t *B,
-		 const int32_t s_b, uint16_t *C) {
-	if (s_a > s_b)
-		return intersectV1avx_vector16(B, s_b, A, s_a, C);
-	int32_t count = 0;
-	int32_t i_a = 0, i_b = 0;
-	const int32_t st_a = s_a;
-	const int32_t howmanyvec = 2;
-	const int32_t numberofintspervec = howmanyvec* sizeof(__m256i)/ sizeof(uint16_t);
-
-	const int32_t st_b = (s_b / numberofintspervec) * numberofintspervec;
-	__m256i v_b1,v_b2;
-	if ((i_a < st_a) && (i_b < st_b)) {
-		while(i_a < st_a) {
-			uint16_t a = A[i_a];
-			const __m256i v_a = _mm256_set1_epi16(a);
-			while (B[i_b + numberofintspervec - 1] < a) {
-				i_b += numberofintspervec;
-				if (i_b == st_b)
-					goto FINISH_SCALAR;
-			}
-			v_b1 = _mm256_lddqu_si256((const __m256i *) &B[i_b]);
-			v_b2 = _mm256_lddqu_si256((const __m256i *) &B[i_b] + 1);
-
-			__m256i F0 = _mm256_cmpeq_epi16(v_a, v_b1);
-			__m256i F1 = _mm256_cmpeq_epi16(v_a, v_b2);
-			F0 = _mm256_or_si256(F0,F1);
-			count += !_mm256_testz_si256(F0, F0);
-			C[count] = a;
-			++i_a;
-		}
-	}
-	FINISH_SCALAR:
-	// intersect the tail using scalar intersection
-	while (i_a < s_a && i_b < s_b) {
-		if (A[i_a] < B[i_b]) {
-			i_a++;
-		} else if (B[i_b] < A[i_a]) {
-			i_b++;
-		} else {
-			C[count] = A[i_a];
-			count++;
-			i_a++;
-			i_b++;
-		}
-	}
-	return count;
-}
-*/
-/*
- *
- * Useless crap kept around temporarily
-static int32_t intersectV2avx_vector16(const uint16_t *A, const int32_t s_a, const uint16_t *B,
-		 const int32_t s_b, uint16_t *C) {
-	if (s_a > s_b)
-		return intersectV1avx_vector16(B, s_b, A, s_a, C);
-	int32_t count = 0;
-	int32_t i_a = 0, i_b = 0;
-	const int32_t st_a = s_a;
-	const int32_t howmanyvec = 4;
-	const int32_t numberofintspervec = howmanyvec* sizeof(__m256i)/ sizeof(uint16_t);
-
-	const int32_t st_b = (s_b / numberofintspervec) * numberofintspervec;
-	__m256i v_b1,v_b2,v_b3,v_b4;
-	if ((i_a < st_a) && (i_b < st_b)) {
-		while(i_a < st_a) {
-			uint16_t a = A[i_a];
-			const __m256i v_a = _mm256_set1_epi16(a);
-			while (B[i_b + numberofintspervec - 1] < a) {
-				i_b += numberofintspervec;
-				if (i_b == st_b)
-					goto FINISH_SCALAR;
-			}
-			v_b1 = _mm256_lddqu_si256((const __m256i *) &B[i_b]);
-			v_b2 = _mm256_lddqu_si256((const __m256i *) &B[i_b] + 1);
-			v_b3 = _mm256_lddqu_si256((const __m256i *) &B[i_b] + 2);
-			v_b4 = _mm256_lddqu_si256((const __m256i *) &B[i_b] + 3);
-
-			__m256i F0 = _mm256_cmpeq_epi16(v_a, v_b1);
-			__m256i F1 = _mm256_cmpeq_epi16(v_a, v_b2);
-			__m256i F2 = _mm256_cmpeq_epi16(v_a, v_b3);
-			__m256i F3 = _mm256_cmpeq_epi16(v_a, v_b4);
-
-			F0 = _mm256_or_si256(F0,F1);
-			F2 = _mm256_or_si256(F2,F3);
-
-			F0 = _mm256_or_si256(F0,F2);
-			count += !_mm256_testz_si256(F0, F0);
-			C[count] = a;
-			++i_a;
-		}
-	}
-	FINISH_SCALAR:
-	// intersect the tail using scalar intersection
-	while (i_a < s_a && i_b < s_b) {
-		if (A[i_a] < B[i_b]) {
-			i_a++;
-		} else if (B[i_b] < A[i_a]) {
-			i_b++;
-		} else {
-			C[count] = A[i_a];
-			count++;
-			i_a++;
-			i_b++;
-		}
-	}
-	return count;
-}*/
-
-int32_t intersection2by2(
-		uint16_t * set1, int32_t lenset1,
-		uint16_t * set2, int32_t lenset2,
-		uint16_t * buffer) {
-	const int32_t thres = 64; // TODO: adjust this threshold
-	if (lenset1 * thres < lenset2) {
-		// TODO: a SIMD-enabled galloping intersection algorithm should be designed
-		return onesidedgallopingintersect2by2(set1, lenset1, set2, lenset2, buffer);
-	} else if( lenset2 * thres < lenset1) {
-		// TODO: a SIMD-enabled galloping intersection algorithm should be designed
-		return onesidedgallopingintersect2by2(set2, lenset2, set1, lenset1, buffer);
-	} else {
-		return intersect_vector16(set1,lenset1,set2,lenset2,buffer);
-	}
-}
-
-#else
-
-int32_t intersection2by2(
-	uint16_t * set1, int32_t lenset1,
-	uint16_t * set2, int32_t lenset2,
-	uint16_t * buffer)  {
-	int32_t thres = 64; // TODO: adjust this threshold
-	if (lenset1 * thres < lenset2) {
-		return onesidedgallopingintersect2by2(set1, lenset1, set2, lenset2, buffer);
-	} else if( lenset2 * thres < lenset1) {
-		return onesidedgallopingintersect2by2(set2, lenset2, set1, lenset1, buffer);
-	} else {
-		return match_scalar(set1, lenset1, set2, lenset2, buffer);
-	}
-}
-
-#endif // #ifdef USEAVX
-
+static inline int32_t minimum(int32_t a, int32_t b) { return (a < b) ? a : b; }
 
 /* computes the intersection of array1 and array2 and write the result to
  * arrayout.
  * It is assumed that arrayout is distinct from both array1 and array2.
  * */
 void array_container_intersection(const array_container_t *array1,
-                         const array_container_t *array2,
-                         array_container_t *arrayout) {
-	int32_t minc = array1->cardinality < array2->cardinality ? array1->cardinality : array2->cardinality;
-	if(arrayout->capacity < minc)
-		increaseCapacity(arrayout,minc,INT32_MAX,false);
-	arrayout->cardinality =  intersection2by2(array1->array, array1->cardinality,
-			array2->array, array2->cardinality, arrayout->array);
+                                  const array_container_t *array2,
+                                  array_container_t *out) {
+    int32_t card_1 = array1->cardinality, card_2 = array2->cardinality,
+            min_card = minimum(card_1, card_2);
+    const int threshold = 64;  // subject to tuning
+#ifdef USEAVX
+    min_card += sizeof(__m128i) / sizeof(uint16_t);
+#endif
+    if (out->capacity < min_card)
+        array_container_grow(out, min_card, INT32_MAX, false);
+    if (card_1 * threshold < card_2) {
+        out->cardinality = intersect_skewed_uint16(
+            array1->array, card_1, array2->array, card_2, out->array);
+    } else if (card_2 * threshold < card_1) {
+        out->cardinality = intersect_skewed_uint16(
+            array2->array, card_2, array1->array, card_1, out->array);
+    } else {
+#ifdef USEAVX
+        out->cardinality = intersect_vector16(
+            array1->array, card_1, array2->array, card_2, out->array);
+#else
+        out->cardinality = intersect_uint16(array1->array, card_1,
+                                            array2->array, card_2, out->array);
+#endif
+    }
 }
 
+/* computes the intersection of array1 and array2 and write the result to
+ * array1.
+ * */
+void array_container_intersection_inplace(array_container_t *src_1,
+                                          const array_container_t *src_2) {
+    // todo: can any of this be vectorized?
+    int32_t card_1 = src_1->cardinality, card_2 = src_2->cardinality;
+    const int threshold = 64;  // subject to tuning
+    if (card_1 * threshold < card_2) {
+        src_1->cardinality = intersect_skewed_uint16(
+            src_1->array, card_1, src_2->array, card_2, src_1->array);
+    } else if (card_2 * threshold < card_1) {
+        src_1->cardinality = intersect_skewed_uint16(
+            src_2->array, card_2, src_1->array, card_1, src_1->array);
+    } else {
+        src_1->cardinality = intersect_uint16(
+            src_1->array, card_1, src_2->array, card_2, src_1->array);
+    }
+}
+
+int array_container_to_uint32_array(uint32_t *out,
+                                    const array_container_t *cont,
+                                    uint32_t base) {
+    int outpos = 0;
+    for (int i = 0; i < cont->cardinality; ++i) {
+        out[outpos++] = base + cont->array[i];
+    }
+    return outpos;
+}
+
+void array_container_printf(const array_container_t *v) {
+    if (v->cardinality == 0) {
+        printf("{}");
+        return;
+    }
+    printf("{");
+    printf("%d", v->array[0]);
+    for (int i = 1; i < v->cardinality; ++i) {
+        printf(",%d", v->array[i]);
+    }
+    printf("}");
+}
+
+void array_container_printf_as_uint32_array(const array_container_t *v,
+                                            uint32_t base) {
+    if (v->cardinality == 0) {
+        return;
+    }
+    printf("%d", v->array[0] + base);
+    for (int i = 1; i < v->cardinality; ++i) {
+        printf(",%d", v->array[i] + base);
+    }
+}
+
+/* Compute the number of runs */
+int32_t array_container_number_of_runs(const array_container_t *a) {
+    // Can SIMD work here?
+    int32_t nr_runs = 0;
+    int32_t prev = -2;
+    for (const uint16_t *p = a->array; p != a->array + a->cardinality; ++p) {
+        if (*p != prev + 1) nr_runs++;
+        prev = *p;
+    }
+    return nr_runs;
+}
+
+int32_t array_container_serialize(array_container_t *container, char *buf) {
+    int32_t l, off;
+    uint16_t cardinality = (uint16_t)container->cardinality;
+
+    memcpy(buf, &cardinality, off = sizeof(cardinality));
+    l = sizeof(uint16_t) * container->cardinality;
+    if (l) memcpy(&buf[off], container->array, l);
+
+    return (off + l);
+}
+
+/**
+ * Writes the underlying array to buf, outputs how many bytes were written.
+ * The number of bytes written should be
+ * array_container_size_in_bytes(container).
+ *
+ */
+int32_t array_container_write(array_container_t *container, char *buf) {
+    if (IS_BIG_ENDIAN) {
+        // forcing little endian (could be faster)
+        for (int32_t i = 0; i < container->cardinality; i++) {
+            uint16_t val = container->array[i];
+            buf[2 * i] = (uint8_t)val;
+            buf[2 * i + 1] = (uint8_t)(val >> 8);
+        }
+    } else {
+        memcpy(buf, container->array,
+               container->cardinality * sizeof(uint16_t));
+    }
+    return array_container_size_in_bytes(container);
+}
+
+bool array_container_equals(array_container_t *container1,
+                            array_container_t *container2) {
+    if (container1->cardinality != container2->cardinality) {
+        return false;
+    }
+    // could be vectorized:
+    for (int32_t i = 0; i < container1->cardinality; ++i) {
+        if (container1->array[i] != container2->array[i]) return false;
+    }
+    return true;
+}
+
+int32_t array_container_read(int32_t cardinality, array_container_t *container,
+                             const char *buf) {
+    if (container->capacity < cardinality) {
+        array_container_grow(container, cardinality, DEFAULT_MAX_SIZE, false);
+    }
+    container->cardinality = cardinality;
+    assert(!IS_BIG_ENDIAN);  // TODO: Implement
+
+    memcpy(container->array, buf, container->cardinality * sizeof(uint16_t));
+
+    return array_container_size_in_bytes(container);
+}
+
+uint32_t array_container_serialization_len(array_container_t *container) {
+    return (sizeof(uint16_t) /* container->cardinality converted to 16 bit */ +
+            (sizeof(uint16_t) * container->cardinality));
+}
+
+void *array_container_deserialize(const char *buf, size_t buf_len) {
+    array_container_t *ptr;
+
+    if (buf_len < 2) /* capacity converted to 16 bit */
+        return (NULL);
+    else
+        buf_len -= 2;
+
+    if ((ptr = malloc(sizeof(array_container_t))) != NULL) {
+        size_t len;
+        int32_t off;
+        uint16_t cardinality;
+
+        memcpy(&cardinality, buf, off = sizeof(cardinality));
+
+        ptr->capacity = ptr->cardinality = (uint32_t)cardinality;
+        len = sizeof(uint16_t) * ptr->cardinality;
+
+        if (len != buf_len) {
+            free(ptr);
+            return (NULL);
+        }
+
+        if ((ptr->array = malloc(sizeof(uint16_t) * ptr->capacity)) == NULL) {
+            free(ptr);
+            return (NULL);
+        }
+
+        if (len) memcpy(ptr->array, &buf[off], len);
+
+        /* Check if returned values are monotonically increasing */
+        for (int32_t i = 0, j = 0; i < ptr->cardinality; i++) {
+            if (ptr->array[i] < j) {
+                free(ptr->array);
+                free(ptr);
+                return (NULL);
+            } else
+                j = ptr->array[i];
+        }
+    }
+
+    return (ptr);
+}
+
+void array_container_iterate(const array_container_t *cont, uint32_t base,
+                             roaring_iterator iterator, void *ptr) {
+    for (int i = 0; i < cont->cardinality; i++)
+        iterator(cont->array[i] + base, ptr);
+}

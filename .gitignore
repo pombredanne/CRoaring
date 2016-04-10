@@ -32,6 +32,16 @@
 *.dSYM/
 
 # binaries
-bitset_container_benchmark
-bitset_container_unit
+*_benchmark
+*_unit
 unit
+
+# CMake
+CMakeCache.txt
+CMakeFiles
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing
+Makefile
+config.h
