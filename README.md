@@ -32,12 +32,12 @@ of the latest hardware. Roaring bitmaps are already available on a variety of pl
 # Requirements
 
 - 64-bit Linux-like operating system (including MacOS)
-- Recent Intel processor: Haswell (2013) or better.
+- Recent Intel processor: Haswell (2013) or better. For legacy Intel processors without AVX support, build the project with ``-DAVX_TUNING=OFF``.
 - Recent C compiler (GCC 4.8 or better)
 - CMake
 - clang-format (optional)
 
-Support for legacy hardware and compiler might be added later.
+Support for non-Intel hardware  and other compilers might be added later. Contributions are invited.
 
 # Example
 
@@ -76,6 +76,7 @@ roaring_bitmap_t *r3 = roaring_bitmap_of_ptr(3, somevalues);
 uint32_t card1;
 uint32_t *arr1 = roaring_bitmap_to_uint32_array(r1, &card1);
 roaring_bitmap_t *r1f = roaring_bitmap_of_ptr(card1, arr1);
+free(arr1);
 assert(roaring_bitmap_equals(r1, r1f));  // what we recover is equal
 
 // we can copy and compare bitmaps
@@ -92,8 +93,13 @@ const roaring_bitmap_t *allmybitmaps[] = {r1, r2, r3};
 roaring_bitmap_t *bigunion = roaring_bitmap_or_many(3, allmybitmaps);
 assert(
     roaring_bitmap_equals(r1_2_3, bigunion));  // what we recover is equal
+// can also do the big union with a heap
+roaring_bitmap_t *bigunionheap = roaring_bitmap_or_many_heap(3, allmybitmaps);
+assert_true(roaring_bitmap_equals(r1_2_3, bigunionheap));
+
 roaring_bitmap_free(r1_2_3);
 roaring_bitmap_free(bigunion);
+roaring_bitmap_free(bigunionheap);
 
 // we can compute intersection two-by-two
 roaring_bitmap_t *i1_2 = roaring_bitmap_and(r1, r2);
@@ -125,35 +131,36 @@ roaring_bitmap_free(r3);
 
 # Building
 
-CRoaring follows the standard cmake workflow:
+CRoaring follows the standard cmake workflow. Starting from the root directory of
+the project (CRoaring), you can do:
 
 ```
-mkdir build
+mkdir -p build
 cd build
 cmake ..
 make
 ```
+(You can replace the ``build`` directory with any other directory name.)
 
-For debug release, try
+For a debug release, starting from the root directory of the project (CRoaring), try
 
 ```
-mkdir debug
+mkdir -p debug
 cd debug
-cmake -DCMAKE_BUILD_TYPE=Debug ..
+cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=ON ..
 make
 ```
 
-To turn on sanitizer flags, try
-```
-cmake -DSANITIZE=1
-```
+(Of course you can replace the ``debug`` directory with any other directory name.)
 
 
-To run unit tests:
+To run unit tests (you must first run ``make``):
 
 ```
 make test
 ```
+
+The detailed output of the tests can be found in ``Testing/Temporary/LastTest.log``.
 
 To run real-data benchmark
 
@@ -184,7 +191,7 @@ To reformat your code according to the style convention (make sure that ``clang-
 
 -  Samy Chambi, Daniel Lemire, Owen Kaser, Robert Godin,
 Better bitmap performance with Roaring bitmaps,
-Software: Practice and Experience (accepted in 2015, to appear)
+Software: Practice and Experience Volume 46, Issue 5, pages 709–719, May 2016
 http://arxiv.org/abs/1402.6407 This paper used data from http://lemire.me/data/realroaring2014.html
 - Daniel Lemire, Gregory Ssi-Yan-Kai, Owen Kaser, Consistently faster and smaller compressed bitmaps with Roaring, Software: Practice and Experience (accepted in 2016, to appear) http://arxiv.org/abs/1603.06549
 

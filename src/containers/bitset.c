@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "bitset.h"
 #include "bitset_util.h"
+#include "containers/bitset.h"
 #include "utilasm.h"
 
 extern int bitset_container_cardinality(const bitset_container_t *bitset);
@@ -383,7 +383,7 @@ int bitset_container_##opname##_nocard(const bitset_container_t *src_1,   \
     for (size_t i = 0; i < BITSET_CONTAINER_SIZE_IN_WORDS; i++) {         \
         out[i] = (array_1[i])opsymbol(array_2[i]);                        \
     }                                                                     \
-    dst->cardinality = BISET_UNKNOWN_CARDINALITY;                                                \
+    dst->cardinality = BITSET_UNKNOWN_CARDINALITY;                                                \
     return dst->cardinality;                                              \
 }                                                                         \
 int bitset_container_##opname##_justcard(const bitset_container_t *src_1,   \
@@ -548,7 +548,7 @@ void* bitset_container_deserialize(const char *buf, size_t buf_len) {
       free(ptr);
       return(NULL);
     }
-    
+
     memcpy(ptr->array, buf, l);
     ptr->cardinality = bitset_container_compute_cardinality(ptr);
   }

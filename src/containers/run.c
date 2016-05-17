@@ -9,7 +9,7 @@
 #include <string.h>
 #include <x86intrin.h>
 
-#include "run.h"
+#include "containers/run.h"
 
 extern bool run_container_is_full(const run_container_t *run);
 extern bool run_container_nonzero_cardinality(const run_container_t *r);
@@ -55,6 +55,40 @@ void run_container_free(run_container_t *run) {
     free(run);
 }
 
+#ifdef USEAVX
+
+/* Get the cardinality of `run'. Requires an actual computation. */
+int run_container_cardinality(const run_container_t *run) {
+    const int32_t n_runs = run->n_runs;
+    const rle16_t *runs = run->runs;
+
+    /* by initializing with n_runs, we omit counting the +1 for each pair. */
+    int sum = n_runs;
+    int32_t k = 0;
+    const int32_t step = sizeof(__m256i)/sizeof(rle16_t);
+    if(n_runs > step) {
+        __m256i total = _mm256_setzero_si256();
+        for(; k + step <= n_runs; k += step) {
+            __m256i ymm1 =
+                _mm256_lddqu_si256((const __m256i *)(runs + k));
+            __m256i justlengths = _mm256_srli_epi32(ymm1,16);
+            total = _mm256_add_epi32(total,justlengths);
+        }
+        // a store might be faster than extract?
+        uint32_t buffer[sizeof(__m256i)/sizeof(rle16_t)];
+        _mm256_store_si256((__m256i*)buffer,total);
+        sum += (buffer[0] + buffer[1]) + (buffer[2] + buffer[3])
+              + (buffer[4] + buffer[5]) + (buffer[6] + buffer[7]);
+    }
+    for (; k < n_runs; ++k) {
+        sum += runs[k].length;
+    }
+
+    return sum;
+}
+
+#else
+
 /* Get the cardinality of `run'. Requires an actual computation. */
 int run_container_cardinality(const run_container_t *run) {
     const int32_t n_runs = run->n_runs;
@@ -68,49 +102,10 @@ int run_container_cardinality(const run_container_t *run) {
 
     return sum;
 }
-
+#endif
 // with some luck: sizeof(struct valuelength_s) = 2 *sizeof(uint16_t) = 4
 _Static_assert(sizeof(rle16_t) == 2 * sizeof(uint16_t),
                "Bad struct size");  // part of C standard
-
-// TODO: could be more efficient
-void run_container_append(run_container_t *run, rle16_t vl) {
-    if (run->n_runs == 0) {
-        run->runs[run->n_runs] = vl;
-        run->n_runs++;
-        return;
-    }
-    const uint32_t previousend =
-        run->runs[run->n_runs - 1].value + run->runs[run->n_runs - 1].length;
-    if (vl.value > previousend + 1) {  // we add a new one
-        run->runs[run->n_runs] = vl;
-        run->n_runs++;
-        return;
-    }
-    uint32_t newend = vl.value + vl.length + UINT32_C(1);
-    if (newend > previousend) {  // we merge
-        run->runs[run->n_runs - 1].length =
-            newend - 1 - run->runs[run->n_runs - 1].value;
-    }
-}
-
-void run_container_append_value(run_container_t *run, uint16_t val) {
-    if (run->n_runs == 0) {
-        run->runs[run->n_runs] = (rle16_t){.value = val, .length = 0};
-        run->n_runs++;
-        return;
-    }
-    const uint32_t previousend =
-        run->runs[run->n_runs - 1].value + run->runs[run->n_runs - 1].length;
-    if (val > previousend + 1) {  // we add a new one
-        run->runs[run->n_runs] = (rle16_t){.value = val, .length = 0};
-        run->n_runs++;
-        return;
-    }
-    if (val == previousend + 1) {  // we merge
-        run->runs[run->n_runs - 1].length++;
-    }
-}
 
 void run_container_grow(run_container_t *run, int32_t min, bool copy) {
     int32_t newCapacity =
@@ -334,21 +329,32 @@ void run_container_union(const run_container_t *src_1,
     int32_t rlepos = 0;
     int32_t xrlepos = 0;
 
+    rle16_t previousrle;
+    if (src_1->runs[rlepos].value <= src_2->runs[xrlepos].value) {
+        previousrle = run_container_append_first(dst, src_1->runs[rlepos]);
+        rlepos++;
+    } else {
+        previousrle = run_container_append_first(dst, src_2->runs[xrlepos]);
+        xrlepos++;
+    }
+
     while ((xrlepos < src_2->n_runs) && (rlepos < src_1->n_runs)) {
+        rle16_t newrl;
         if (src_1->runs[rlepos].value <= src_2->runs[xrlepos].value) {
-            run_container_append(dst, src_1->runs[rlepos]);
+            newrl = src_1->runs[rlepos];
             rlepos++;
         } else {
-            run_container_append(dst, src_2->runs[xrlepos]);
+            newrl = src_2->runs[xrlepos];
             xrlepos++;
         }
+        run_container_append(dst, newrl, &previousrle);
     }
     while (xrlepos < src_2->n_runs) {
-        run_container_append(dst, src_2->runs[xrlepos]);
+        run_container_append(dst, src_2->runs[xrlepos], &previousrle);
         xrlepos++;
     }
     while (rlepos < src_1->n_runs) {
-        run_container_append(dst, src_1->runs[rlepos]);
+        run_container_append(dst, src_1->runs[rlepos], &previousrle);
         rlepos++;
     }
 }
@@ -384,21 +390,31 @@ void run_container_union_inplace(run_container_t *src_1,
     int32_t rlepos = 0;
     int32_t xrlepos = 0;
 
+    rle16_t previousrle;
+    if (inputsrc1[rlepos].value <= src_2->runs[xrlepos].value) {
+        previousrle = run_container_append_first(src_1, inputsrc1[rlepos]);
+        rlepos++;
+    } else {
+        previousrle = run_container_append_first(src_1, src_2->runs[xrlepos]);
+        xrlepos++;
+    }
     while ((xrlepos < src_2->n_runs) && (rlepos < input1nruns)) {
+        rle16_t newrl;
         if (inputsrc1[rlepos].value <= src_2->runs[xrlepos].value) {
-            run_container_append(src_1, inputsrc1[rlepos]);
+            newrl = inputsrc1[rlepos];
             rlepos++;
         } else {
-            run_container_append(src_1, src_2->runs[xrlepos]);
+            newrl = src_2->runs[xrlepos];
             xrlepos++;
         }
+        run_container_append(src_1, newrl, &previousrle);
     }
     while (xrlepos < src_2->n_runs) {
-        run_container_append(src_1, src_2->runs[xrlepos]);
+        run_container_append(src_1, src_2->runs[xrlepos], &previousrle);
         xrlepos++;
     }
     while (rlepos < input1nruns) {
-        run_container_append(src_1, inputsrc1[rlepos]);
+        run_container_append(src_1, inputsrc1[rlepos], &previousrle);
         rlepos++;
     }
 }
