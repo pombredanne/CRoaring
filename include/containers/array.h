@@ -42,7 +42,7 @@ array_container_t *array_container_create_given_capacity(int32_t size);
 void array_container_free(array_container_t *array);
 
 /* Duplicate container */
-array_container_t *array_container_clone(array_container_t *src);
+array_container_t *array_container_clone(const array_container_t *src);
 
 int32_t array_container_serialize(array_container_t *container,
                                   char *buf) WARN_UNUSED;
@@ -72,6 +72,11 @@ static inline bool array_container_nonzero_cardinality(
 
 /* Copy one container into another. We assume that they are distinct. */
 void array_container_copy(const array_container_t *src, array_container_t *dst);
+
+/*  Add all the values in [min,max) (included) at a distance k*step from min.
+    The container must have a size less or equal to DEFAULT_MAX_SIZE after this addition. */
+void array_container_add_from_range(array_container_t *arr, uint32_t min, uint32_t max,
+                                    uint16_t step);
 
 /* Set the cardinality to zero (does not release memory). */
 static inline void array_container_clear(array_container_t *array) {
@@ -172,7 +177,7 @@ void array_container_iterate(const array_container_t *cont, uint32_t base,
  * array_container_size_in_bytes(container).
  *
  */
-int32_t array_container_write(array_container_t *container, char *buf);
+int32_t array_container_write(const array_container_t *container, char *buf);
 /**
  * Reads the instance from buf, outputs how many bytes were read.
  * This is meant to be byte-by-byte compatible with the Java and Go versions of
@@ -192,7 +197,7 @@ int32_t array_container_read(int32_t cardinality, array_container_t *container,
  *
  */
 static inline int32_t array_container_size_in_bytes(
-    array_container_t *container) {
+    const array_container_t *container) {
     return container->cardinality * sizeof(uint16_t);
 }
 

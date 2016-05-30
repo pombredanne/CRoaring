@@ -46,7 +46,7 @@ array_container_t *array_container_create() {
 }
 
 /* Duplicate container */
-array_container_t *array_container_clone(array_container_t *src) {
+array_container_t *array_container_clone(const array_container_t *src) {
     array_container_t *new =
         array_container_create_given_capacity(src->capacity);
     if (new == NULL) return NULL;
@@ -127,6 +127,13 @@ static void array_container_append(array_container_t *arr, uint16_t pos) {
     }
 
     arr->array[arr->cardinality++] = pos;
+}
+
+void array_container_add_from_range(array_container_t *arr, uint32_t min, uint32_t max,
+                                    uint16_t step) {
+    for(uint32_t value = min ; value < max ; value += step) {
+        array_container_append(arr, value);
+    }
 }
 
 /* Add x to the set. Returns true if x was not already present.  */
@@ -313,7 +320,7 @@ int32_t array_container_serialize(array_container_t *container, char *buf) {
  * array_container_size_in_bytes(container).
  *
  */
-int32_t array_container_write(array_container_t *container, char *buf) {
+int32_t array_container_write(const array_container_t *container, char *buf) {
     if (IS_BIG_ENDIAN) {
         // forcing little endian (could be faster)
         for (int32_t i = 0; i < container->cardinality; i++) {

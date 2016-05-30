@@ -30,8 +30,14 @@ void bitset_container_clear(bitset_container_t *bitset) {
     bitset->cardinality = 0;
 }
 
+void bitset_container_set_all(bitset_container_t *bitset) {
+    memset(bitset->array, INT64_C(-1),
+           sizeof(uint64_t) * BITSET_CONTAINER_SIZE_IN_WORDS);
+    bitset->cardinality = (1 << 16);
+}
+
 /* Create a new bitset. Return NULL in case of failure. */
-bitset_container_t *bitset_container_create() {
+bitset_container_t *bitset_container_create(void) {
     bitset_container_t *bitset = calloc(1, sizeof(bitset_container_t));
 
     if (!bitset) {
@@ -54,6 +60,33 @@ void bitset_container_copy(const bitset_container_t *source,
     dest->cardinality = source->cardinality;
     memcpy(dest->array, source->array,
            sizeof(uint64_t) * BITSET_CONTAINER_SIZE_IN_WORDS);
+}
+
+void bitset_container_add_from_range(bitset_container_t *bitset, uint32_t min, uint32_t max,
+                                   uint16_t step) {
+    if(step == 0) return; // refuse to crash
+    if( ( 64 % step ) == 0) {// step divides 64
+        uint64_t mask = 0;// construct the repeated mask
+        for(uint32_t value = (min % step) ; value < 64 ; value += step) {
+            mask |= ((uint64_t)1 << value);
+        }
+        uint32_t firstword = min / 64;
+        uint32_t endword = (max - 1) / 64;
+        bitset->cardinality = (max-min+step-1)/step;
+        if (firstword == endword) {
+            bitset->array[firstword] |= mask&(((~UINT64_C(0)) << (min % 64)) &
+            ((~UINT64_C(0)) >> ((-max) % 64)));
+            return;
+        }
+        bitset->array[firstword] = mask&((~UINT64_C(0)) << (min % 64));
+        for (uint32_t i = firstword + 1; i < endword; i++) bitset->array[i] = mask;
+        bitset->array[endword] = mask&((~UINT64_C(0)) >> ((-max) % 64));
+    }
+    else {
+        for(uint32_t value = min ; value < max ; value += step) {
+            bitset_container_add(bitset, value);
+        }
+   }
 }
 
 /* Free memory. */
@@ -505,7 +538,7 @@ int32_t bitset_container_serialize(bitset_container_t *container, char *buf) {
 
 
 
-int32_t bitset_container_write(bitset_container_t *container,
+int32_t bitset_container_write(const bitset_container_t *container,
                                   char *buf) {
 if( IS_BIG_ENDIAN){
 	// forcing little endian (could be faster)

@@ -41,6 +41,9 @@ void bitset_container_free(bitset_container_t *bitset);
 /* Clear bitset (sets bits to 0). */
 void bitset_container_clear(bitset_container_t *bitset);
 
+/* Set all bits to 1. */
+void bitset_container_set_all(bitset_container_t *bitset);
+
 /* Duplicate bitset */
 bitset_container_t *bitset_container_clone(const bitset_container_t *src);
 
@@ -203,6 +206,10 @@ static inline bool bitset_container_nonzero_cardinality(
 void bitset_container_copy(const bitset_container_t *source,
                            bitset_container_t *dest);
 
+/*  Add all the values [min,max) at a distance k*step from min: min, min+step,.... */
+void bitset_container_add_from_range(bitset_container_t *bitset, uint32_t min, uint32_t max,
+                                   uint16_t step);
+
 /* Get the number of bits set (force computation). This does not modify bitset.
  * To update the cardinality, you should do
  * bitset->cardinality =  bitset_container_compute_cardinality(bitset).*/
@@ -346,7 +353,7 @@ void bitset_container_iterate(const bitset_container_t *cont, uint32_t base,
  * The number of bytes written should be
  * bitset_container_size_in_bytes(container).
  */
-int32_t bitset_container_write(bitset_container_t *container, char *buf);
+int32_t bitset_container_write(const bitset_container_t *container, char *buf);
 
 /**
  * Reads the instance from buf, outputs how many bytes were read.
@@ -365,7 +372,7 @@ int32_t bitset_container_read(int32_t cardinality,
  * that the cardinality of the container is already known or can be computed.
  */
 static inline int32_t bitset_container_size_in_bytes(
-    bitset_container_t *container) {
+    const bitset_container_t *container) {
     (void)container;
     return BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
 }

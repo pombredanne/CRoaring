@@ -15,6 +15,8 @@ extern bool run_container_is_full(const run_container_t *run);
 extern bool run_container_nonzero_cardinality(const run_container_t *r);
 extern void run_container_clear(run_container_t *run);
 extern int32_t run_container_serialized_size_in_bytes(int32_t num_runs);
+extern run_container_t *run_container_create_range(uint32_t start,
+                                                   uint32_t stop);
 
 enum { DEFAULT_INIT_SIZE = 4 };
 
@@ -35,7 +37,7 @@ run_container_t *run_container_create_given_capacity(int32_t size) {
 }
 
 /* Create a new run container. Return NULL in case of failure. */
-run_container_t *run_container_create() {
+run_container_t *run_container_create(void) {
     return run_container_create_given_capacity(DEFAULT_INIT_SIZE);
 }
 
@@ -65,20 +67,19 @@ int run_container_cardinality(const run_container_t *run) {
     /* by initializing with n_runs, we omit counting the +1 for each pair. */
     int sum = n_runs;
     int32_t k = 0;
-    const int32_t step = sizeof(__m256i)/sizeof(rle16_t);
-    if(n_runs > step) {
+    const int32_t step = sizeof(__m256i) / sizeof(rle16_t);
+    if (n_runs > step) {
         __m256i total = _mm256_setzero_si256();
-        for(; k + step <= n_runs; k += step) {
-            __m256i ymm1 =
-                _mm256_lddqu_si256((const __m256i *)(runs + k));
-            __m256i justlengths = _mm256_srli_epi32(ymm1,16);
-            total = _mm256_add_epi32(total,justlengths);
+        for (; k + step <= n_runs; k += step) {
+            __m256i ymm1 = _mm256_lddqu_si256((const __m256i *)(runs + k));
+            __m256i justlengths = _mm256_srli_epi32(ymm1, 16);
+            total = _mm256_add_epi32(total, justlengths);
         }
         // a store might be faster than extract?
-        uint32_t buffer[sizeof(__m256i)/sizeof(rle16_t)];
-        _mm256_store_si256((__m256i*)buffer,total);
-        sum += (buffer[0] + buffer[1]) + (buffer[2] + buffer[3])
-              + (buffer[4] + buffer[5]) + (buffer[6] + buffer[7]);
+        uint32_t buffer[sizeof(__m256i) / sizeof(rle16_t)];
+        _mm256_store_si256((__m256i *)buffer, total);
+        sum += (buffer[0] + buffer[1]) + (buffer[2] + buffer[3]) +
+               (buffer[4] + buffer[5]) + (buffer[6] + buffer[7]);
     }
     for (; k < n_runs; ++k) {
         sum += runs[k].length;
@@ -552,7 +553,7 @@ int32_t run_container_serialize(run_container_t *container, char *buf) {
     return (off + l);
 }
 
-int32_t run_container_write(run_container_t *container, char *buf) {
+int32_t run_container_write(const run_container_t *container, char *buf) {
     if (IS_BIG_ENDIAN) {
         // forcing little endian (could be faster)
         buf[0] = (uint8_t)(container->n_runs);
@@ -648,10 +649,63 @@ bool run_container_equals(run_container_t *container1,
     if (container1->n_runs != container2->n_runs) {
         return false;
     }
-    for (int32_t i = 1; i < container1->n_runs; ++i) {
+    for (int32_t i = 0; i < container1->n_runs; ++i) {
         if ((container1->runs[i].value != container2->runs[i].value) ||
             (container1->runs[i].length != container2->runs[i].length))
             return false;
     }
     return true;
+}
+
+// TODO: write smart_append_exclusive version to match the overloaded 1 param
+// Java version (or  is it even used?)
+
+// follows the Java implementation closely
+void run_container_smart_append_exclusive(run_container_t *src,
+                                          const uint16_t start,
+                                          const uint16_t length) {
+    int old_end;
+    rle16_t *last_run = src->n_runs ? src->runs + (src->n_runs - 1) : NULL;
+    rle16_t *appended_last_run = src->runs + src->n_runs;
+
+    if (!src->n_runs ||
+        (start > (old_end = last_run->value + last_run->length + 1))) {
+        *appended_last_run = (rle16_t){.value = start, .length = length};
+        src->n_runs++;
+        return;
+    }
+    if (old_end == start) {
+        // we merge
+        last_run->length += (length + 1);
+        return;
+    }
+    int new_end = start + length + 1;
+
+    if (start == last_run->value) {
+        // wipe out previous
+        if (new_end < old_end) {
+            *last_run = (rle16_t){.value = (uint16_t)new_end,
+                                  .length = (uint16_t)(old_end - new_end - 1)};
+            return;
+        } else if (new_end > old_end) {
+            *last_run = (rle16_t){.value = (uint16_t)old_end,
+                                  .length = (uint16_t)(new_end - old_end - 1)};
+            return;
+        } else {
+            src->n_runs--;
+            return;
+        }
+    }
+    last_run->length = start - last_run->value - 1;
+    if (new_end < old_end) {
+        *appended_last_run =
+            (rle16_t){.value = (uint16_t)new_end,
+                      .length = (uint16_t)(old_end - new_end - 1)};
+        src->n_runs++;
+    } else if (new_end > old_end) {
+        *appended_last_run =
+            (rle16_t){.value = (uint16_t)old_end,
+                      .length = (uint16_t)(new_end - old_end - 1)};
+        src->n_runs++;
+    }
 }

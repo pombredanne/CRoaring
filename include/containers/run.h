@@ -43,11 +43,11 @@ struct run_container_s {
 typedef struct run_container_s run_container_t;
 
 /* Create a new run container. Return NULL in case of failure. */
-run_container_t *run_container_create();
+run_container_t *run_container_create(void);
 
 /* Create a new run container with given capacity. Return NULL in case of
  * failure. */
-run_container_t *run_container_create_given_capacity();
+run_container_t *run_container_create_given_capacity(int32_t size);
 
 /* Free memory owned by `run'. */
 void run_container_free(run_container_t *run);
@@ -87,6 +87,8 @@ void run_container_copy(const run_container_t *src, run_container_t *dst);
 static inline void run_container_clear(run_container_t *run) {
     run->n_runs = 0;
 }
+
+
 
 /**
  * Append run described by vl to the run container, possibly merging.
@@ -228,7 +230,7 @@ void run_container_iterate(const run_container_t *cont, uint32_t base,
  * Roaring.
  * The number of bytes written should be run_container_size_in_bytes(container).
  */
-int32_t run_container_write(run_container_t *container, char *buf);
+int32_t run_container_write(const run_container_t *container, char *buf);
 
 /**
  * Reads the instance from buf, outputs how many bytes were read.
@@ -246,7 +248,7 @@ int32_t run_container_read(int32_t cardinality, run_container_t *container,
  * Return the serialized size in bytes of a container (see run_container_write).
  * This is meant to be compatible with the Java and Go versions of Roaring.
  */
-static inline int32_t run_container_size_in_bytes(run_container_t *container) {
+static inline int32_t run_container_size_in_bytes(const run_container_t *container) {
     return run_container_serialized_size_in_bytes(container->n_runs);
 }
 
@@ -255,5 +257,24 @@ static inline int32_t run_container_size_in_bytes(run_container_t *container) {
  */
 bool run_container_equals(run_container_t *container1,
                           run_container_t *container2);
+
+/**
+ * Used in a start-finish scan that appends segments, for XOR and NOT
+ */
+
+void run_container_smart_append_exclusive(run_container_t *src,
+                                          const uint16_t start,
+                                          const uint16_t length);
+
+/* The new container consists of a single run. Returns NULL on failure */
+static inline run_container_t *run_container_create_range(uint32_t start,
+                                                          uint32_t stop) {
+    run_container_t *rc = run_container_create_given_capacity(1);
+    if (rc)
+        run_container_append_first(
+            rc, (rle16_t){.value = (uint16_t)start,
+                          .length = (uint16_t)(stop - start - 1)});
+    return rc;
+}
 
 #endif /* INCLUDE_CONTAINERS_RUN_H_ */

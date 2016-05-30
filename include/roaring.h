@@ -11,14 +11,21 @@ An implementation of Roaring Bitmaps in C.
 
 typedef struct roaring_bitmap_s {
     roaring_array_t *high_low_container;
+    bool copy_on_write;  /* copy_on_write: whether you want to use copy-on-write
+                          (saves memory and avoids
+                          copies but needs more care in a threaded context). */
 } roaring_bitmap_t;
-
 
 /**
  * Creates a new bitmap (initially empty)
  */
 roaring_bitmap_t *roaring_bitmap_create(void);
 
+/**
+ * Add all the values between min (included) and max (excluded) that are at a
+ * distance k*step from min.
+*/
+roaring_bitmap_t *roaring_bitmap_from_range(uint32_t min, uint32_t max, uint32_t step);
 
 /**
  * Creates a new bitmap (initially empty) with a provided
@@ -32,6 +39,11 @@ roaring_bitmap_t *roaring_bitmap_create_with_capacity(uint32_t cap);
 roaring_bitmap_t *roaring_bitmap_of_ptr(size_t n_args, const uint32_t *vals);
 
 /**
+ * Describe the inner structure of the bitmap.
+ */
+void roaring_bitmap_printf_describe(const roaring_bitmap_t *ra);
+
+/**
  * Creates a new bitmap from a list of uint32_t integers
  */
 roaring_bitmap_t *roaring_bitmap_of(size_t n, ...);
@@ -39,6 +51,7 @@ roaring_bitmap_t *roaring_bitmap_of(size_t n, ...);
 /**
  * Copies a  bitmap. This does memory allocation. The caller is responsible for
  * memory management.
+ *
  */
 roaring_bitmap_t *roaring_bitmap_copy(const roaring_bitmap_t *r);
 
@@ -65,34 +78,38 @@ void roaring_bitmap_and_inplace(roaring_bitmap_t *x1,
 /**
  * Computes the union between two bitmaps and returns new bitmap. The caller is
  * responsible for memory management.
- *
  */
 roaring_bitmap_t *roaring_bitmap_or(const roaring_bitmap_t *x1,
                                     const roaring_bitmap_t *x2);
 
 /**
  * Inplace version of roaring_bitmap_or, modifies x1
+ *
  */
 void roaring_bitmap_or_inplace(roaring_bitmap_t *x1,
                                const roaring_bitmap_t *x2);
+
 
 /**
  * Compute the union of 'number' bitmaps. See also roaring_bitmap_or_many_heap.
  * Caller is responsible for freeing the
  * result.
+ *
  */
 roaring_bitmap_t *roaring_bitmap_or_many(size_t number,
                                          const roaring_bitmap_t **x);
-
 
 /**
  * Compute the union of 'number' bitmaps using a heap. This can
  * sometimes be faster than roaring_bitmap_or_many which uses
  * a naive algorithm. Caller is responsible for freeing the
  * result.
+ *
  */
 roaring_bitmap_t *roaring_bitmap_or_many_heap(uint32_t number,
                                               const roaring_bitmap_t **x);
+
+
 /**
  * Frees the memory.
  */
@@ -198,6 +215,7 @@ roaring_bitmap_t *roaring_bitmap_lazy_or(const roaring_bitmap_t *x1,
 /**
  * (For expert users who seek high performance.)
  * Inplace version of roaring_bitmap_lazy_or, modifies x1
+ *
  */
 void roaring_bitmap_lazy_or_inplace(roaring_bitmap_t *x1,
                                     const roaring_bitmap_t *x2);
@@ -210,3 +228,20 @@ void roaring_bitmap_lazy_or_inplace(roaring_bitmap_t *x1,
  * or modified with roaring_bitmap_lazy_or_inplace.
  */
 void roaring_bitmap_repair_after_lazy(roaring_bitmap_t *x1);
+
+/**
+ * compute the negation of the roaring bitmap within a specified interval.
+ * areas outside the range are passed through unchanged.
+ */
+
+roaring_bitmap_t *roaring_bitmap_flip(const roaring_bitmap_t *x1,
+                                      uint64_t range_start, uint64_t range_end);
+
+/**
+ * compute (in place) the negation of the roaring bitmap within a specified
+ * interval.
+ * areas outside the range are passed through unchanged.
+ */
+
+void roaring_bitmap_flip_inplace(roaring_bitmap_t *x1, uint64_t range_start,
+                                 uint64_t range_end);
