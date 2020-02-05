@@ -3,150 +3,234 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
-#include "containers/bitset.h"
-#include "containers/containers.h"
-#include "roaring_array.h"
-
-// ported from RoaringArray.java
-// Todo: optimization (eg branchless binary search)
-// Go version has copy-on-write, has combo binary/sequential search
-// AND: fast SIMD and on key sets; containerwise AND; SIMD partial sum
-//    with +1 for nonempty containers, 0 for empty containers
-//    then use this to pack the arrays for the result.
+#include <roaring/containers/bitset.h>
+#include <roaring/containers/containers.h>
+#include <roaring/roaring_array.h>
 
 // Convention: [0,ra->size) all elements are initialized
 //  [ra->size, ra->allocation_size) is junk and contains nothing needing freeing
 
-extern int32_t ra_get_size(roaring_array_t *ra);
+extern inline int32_t ra_get_size(const roaring_array_t *ra);
+extern inline int32_t ra_get_index(const roaring_array_t *ra, uint16_t x);
+extern inline void *ra_get_container_at_index(const roaring_array_t *ra,
+                                              uint16_t i, uint8_t *typecode);
+extern inline void ra_unshare_container_at_index(roaring_array_t *ra,
+                                                 uint16_t i);
+extern inline void ra_replace_key_and_container_at_index(roaring_array_t *ra,
+                                                         int32_t i,
+                                                         uint16_t key, void *c,
+                                                         uint8_t typecode);
+extern inline void ra_set_container_at_index(const roaring_array_t *ra,
+                                             int32_t i, void *c,
+                                             uint8_t typecode);
 
-#define INITIAL_CAPACITY 4
+static bool realloc_array(roaring_array_t *ra, int32_t new_capacity) {
+    // because we combine the allocations, it is not possible to use realloc
+    /*ra->keys =
+    (uint16_t *)realloc(ra->keys, sizeof(uint16_t) * new_capacity);
+ra->containers =
+    (void **)realloc(ra->containers, sizeof(void *) * new_capacity);
+ra->typecodes =
+    (uint8_t *)realloc(ra->typecodes, sizeof(uint8_t) * new_capacity);
+if (!ra->keys || !ra->containers || !ra->typecodes) {
+    free(ra->keys);
+    free(ra->containers);
+    free(ra->typecodes);
+    return false;
+}*/
 
-roaring_array_t *ra_create_with_capacity(uint32_t cap) {
-    roaring_array_t *new_ra = malloc(sizeof(roaring_array_t));
-    if (!new_ra) return NULL;
+    if ( new_capacity == 0 ) {
+      free(ra->containers);
+      ra->containers = NULL;
+      ra->keys = NULL;
+      ra->typecodes = NULL;
+      ra->allocation_size = 0;
+      return true;
+    }
+    const size_t memoryneeded =
+        new_capacity * (sizeof(uint16_t) + sizeof(void *) + sizeof(uint8_t));
+    void *bigalloc = malloc(memoryneeded);
+    if (!bigalloc) return false;
+    void *oldbigalloc = ra->containers;
+    void **newcontainers = (void **)bigalloc;
+    uint16_t *newkeys = (uint16_t *)(newcontainers + new_capacity);
+    uint8_t *newtypecodes = (uint8_t *)(newkeys + new_capacity);
+    assert((char *)(newtypecodes + new_capacity) ==
+           (char *)bigalloc + memoryneeded);
+    if(ra->size > 0) {
+      memcpy(newcontainers, ra->containers, sizeof(void *) * ra->size);
+      memcpy(newkeys, ra->keys, sizeof(uint16_t) * ra->size);
+      memcpy(newtypecodes, ra->typecodes, sizeof(uint8_t) * ra->size);
+    }
+    ra->containers = newcontainers;
+    ra->keys = newkeys;
+    ra->typecodes = newtypecodes;
+    ra->allocation_size = new_capacity;
+    free(oldbigalloc);
+    return true;
+}
+
+bool ra_init_with_capacity(roaring_array_t *new_ra, uint32_t cap) {
+    if (!new_ra) return false;
+    ra_init(new_ra);
+
+    if (cap > INT32_MAX) { return false; }
+
+    if(cap > 0) {
+      void *bigalloc =
+        malloc(cap * (sizeof(uint16_t) + sizeof(void *) + sizeof(uint8_t)));
+      if( bigalloc == NULL ) return false;
+      new_ra->containers = (void **)bigalloc;
+      new_ra->keys = (uint16_t *)(new_ra->containers + cap);
+      new_ra->typecodes = (uint8_t *)(new_ra->keys + cap);
+      // Narrowing is safe because of above check
+      new_ra->allocation_size = (int32_t)cap;
+    }
+    return true;
+}
+
+int ra_shrink_to_fit(roaring_array_t *ra) {
+    int savings = (ra->allocation_size - ra->size) *
+                  (sizeof(uint16_t) + sizeof(void *) + sizeof(uint8_t));
+    if (!realloc_array(ra, ra->size)) {
+      return 0;
+    }
+    ra->allocation_size = ra->size;
+    return savings;
+}
+
+void ra_init(roaring_array_t *new_ra) {
+    if (!new_ra) { return; }
     new_ra->keys = NULL;
     new_ra->containers = NULL;
     new_ra->typecodes = NULL;
 
-    new_ra->allocation_size = cap;
-    new_ra->keys = malloc(cap * sizeof(uint16_t));
-    new_ra->containers = malloc(cap * sizeof(void *));
-    new_ra->typecodes = malloc(cap * sizeof(uint8_t));
-    if (!new_ra->keys || !new_ra->containers || !new_ra->typecodes ) {
-        free(new_ra);
-        free(new_ra->keys);
-        free(new_ra->containers);
-        free(new_ra->typecodes);
-        return NULL;
-    }
+    new_ra->allocation_size = 0;
     new_ra->size = 0;
-
-    return new_ra;
+    new_ra->flags = 0;
 }
 
-roaring_array_t *ra_create() {
-    return ra_create_with_capacity(INITIAL_CAPACITY);
-}
-
-roaring_array_t *ra_copy(roaring_array_t *r, bool copy_on_write) {
-    roaring_array_t *new_ra = malloc(sizeof(roaring_array_t));
-    if (!new_ra) return NULL;
-    new_ra->keys = NULL;
-    new_ra->containers = NULL;
-    new_ra->typecodes = NULL;
-
-    const int32_t allocsize = r->allocation_size;
-    new_ra->allocation_size = allocsize;
-    new_ra->keys = malloc(allocsize * sizeof(uint16_t));
-    new_ra->containers =
-        calloc(allocsize, sizeof(void *));  // setting pointers to zero
-    new_ra->typecodes = malloc(allocsize * sizeof(uint8_t));
-    if (!new_ra->keys || !new_ra->containers || !new_ra->typecodes ) {
-        free(new_ra);
-        free(new_ra->keys);
-        free(new_ra->containers);
-        free(new_ra->typecodes);
-        return NULL;
+bool ra_copy(const roaring_array_t *source, roaring_array_t *dest,
+             bool copy_on_write) {
+    if (!ra_init_with_capacity(dest, source->size)) return false;
+    dest->size = source->size;
+    dest->allocation_size = source->size;
+    if(dest->size > 0) {
+      memcpy(dest->keys, source->keys, dest->size * sizeof(uint16_t));
     }
-    int32_t s = r->size;
-    new_ra->size = s;
-    memcpy(new_ra->keys, r->keys, s * sizeof(uint16_t));
     // we go through the containers, turning them into shared containers...
-    if(copy_on_write) {
-      for(int32_t i = 0; i < s; ++i) {
-        r->containers[i] = get_copy_of_container(r->containers[i], &r->typecodes[i], copy_on_write);
-      }
-      // we do a shallow copy to the other bitmap
-      memcpy(new_ra->containers, r->containers, s * sizeof(void *));
-      memcpy(new_ra->typecodes, r->typecodes, s * sizeof(uint8_t));
+    if (copy_on_write) {
+        for (int32_t i = 0; i < dest->size; ++i) {
+            source->containers[i] = get_copy_of_container(
+                source->containers[i], &source->typecodes[i], copy_on_write);
+        }
+        // we do a shallow copy to the other bitmap
+        if(dest->size > 0) {
+          memcpy(dest->containers, source->containers,
+               dest->size * sizeof(void *));
+          memcpy(dest->typecodes, source->typecodes,
+               dest->size * sizeof(uint8_t));
+        }
     } else {
-      memcpy(new_ra->typecodes, r->typecodes, s * sizeof(uint8_t));
-      for (int32_t i = 0; i < s; i++) {
-        new_ra->containers[i] =
-            container_clone(r->containers[i], r->typecodes[i]);
-        if (new_ra->containers[i] == NULL) {
-            for (int32_t j = 0; j < i; j++) {
-                container_free(r->containers[j], r->typecodes[j]);
+        if(dest->size > 0) {
+          memcpy(dest->typecodes, source->typecodes,
+               dest->size * sizeof(uint8_t));
+        }
+        for (int32_t i = 0; i < dest->size; i++) {
+            dest->containers[i] =
+                container_clone(source->containers[i], source->typecodes[i]);
+            if (dest->containers[i] == NULL) {
+                for (int32_t j = 0; j < i; j++) {
+                    container_free(dest->containers[j], dest->typecodes[j]);
+                }
+                ra_clear_without_containers(dest);
+                return false;
             }
-            free(new_ra);
-            free(new_ra->keys);
-            free(new_ra->containers);
-            free(new_ra->typecodes);
-            return NULL;
         }
-      }
     }
-    return new_ra;
+    return true;
 }
 
-static void ra_clear(roaring_array_t *ra) {
-    free(ra->keys);
-    ra->keys = NULL;  // paranoid
-    for (int i = 0; i < ra->size; ++i) {
-          container_free(ra->containers[i], ra->typecodes[i]);
+bool ra_overwrite(const roaring_array_t *source, roaring_array_t *dest,
+                  bool copy_on_write) {
+    ra_clear_containers(dest);  // we are going to overwrite them
+    if (dest->allocation_size < source->size) {
+        if (!realloc_array(dest, source->size)) {
+            return false;
+        }
     }
-    free(ra->containers);
-    ra->containers = NULL;  // paranoid
-    free(ra->typecodes);
-    ra->typecodes = NULL;  // paranoid
+    dest->size = source->size;
+    memcpy(dest->keys, source->keys, dest->size * sizeof(uint16_t));
+    // we go through the containers, turning them into shared containers...
+    if (copy_on_write) {
+        for (int32_t i = 0; i < dest->size; ++i) {
+            source->containers[i] = get_copy_of_container(
+                source->containers[i], &source->typecodes[i], copy_on_write);
+        }
+        // we do a shallow copy to the other bitmap
+        memcpy(dest->containers, source->containers,
+               dest->size * sizeof(void *));
+        memcpy(dest->typecodes, source->typecodes,
+               dest->size * sizeof(uint8_t));
+    } else {
+        memcpy(dest->typecodes, source->typecodes,
+               dest->size * sizeof(uint8_t));
+        for (int32_t i = 0; i < dest->size; i++) {
+            dest->containers[i] =
+                container_clone(source->containers[i], source->typecodes[i]);
+            if (dest->containers[i] == NULL) {
+                for (int32_t j = 0; j < i; j++) {
+                    container_free(dest->containers[j], dest->typecodes[j]);
+                }
+                ra_clear_without_containers(dest);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
-static void ra_clear_without_containers(roaring_array_t *ra) {
-    free(ra->keys);
-    ra->keys = NULL;  // paranoid
-    free(ra->containers);
-    ra->containers = NULL;  // paranoid
-    free(ra->typecodes);
-    ra->typecodes = NULL;  // paranoid
+void ra_clear_containers(roaring_array_t *ra) {
+    for (int32_t i = 0; i < ra->size; ++i) {
+        container_free(ra->containers[i], ra->typecodes[i]);
+    }
 }
 
-void ra_free(roaring_array_t *ra) {
-    ra_clear(ra);
-    free(ra);
+void ra_reset(roaring_array_t *ra) {
+  ra_clear_containers(ra);
+  ra->size = 0;
+  ra_shrink_to_fit(ra);
 }
 
-void ra_free_without_containers(roaring_array_t *ra) {
+void ra_clear_without_containers(roaring_array_t *ra) {
+    free(ra->containers);    // keys and typecodes are allocated with containers
+    ra->size = 0;
+    ra->allocation_size = 0;
+    ra->containers = NULL;
+    ra->keys = NULL;
+    ra->typecodes = NULL;
+}
+
+void ra_clear(roaring_array_t *ra) {
+    ra_clear_containers(ra);
     ra_clear_without_containers(ra);
-    free(ra);
 }
 
-void extend_array(roaring_array_t *ra, uint32_t k) {
-    // corresponding Java code uses >= ??
-    int desired_size = ra->size + (int)k;
+bool extend_array(roaring_array_t *ra, int32_t k) {
+    int32_t desired_size = ra->size + k;
+    assert(desired_size <= MAX_CONTAINERS);
     if (desired_size > ra->allocation_size) {
-        int new_capacity =
+        int32_t new_capacity =
             (ra->size < 1024) ? 2 * desired_size : 5 * desired_size / 4;
-
-        ra->keys = realloc(ra->keys, sizeof(uint16_t) * new_capacity);
-        ra->containers = realloc(ra->containers, sizeof(void *) * new_capacity);
-        ra->typecodes = realloc(ra->typecodes, sizeof(uint8_t) * new_capacity);
-        if (!ra->keys || !ra->containers || !ra->typecodes ) {
-            fprintf(stderr, "[%s] %s\n", __FILE__, __func__);
-            perror(0);
+        if (new_capacity > MAX_CONTAINERS) {
+            new_capacity = MAX_CONTAINERS;
         }
-        ra->allocation_size = new_capacity;
+
+        return realloc_array(ra, new_capacity);
     }
+    return true;
 }
 
 void ra_append(roaring_array_t *ra, uint16_t key, void *container,
@@ -160,70 +244,71 @@ void ra_append(roaring_array_t *ra, uint16_t key, void *container,
     ra->size++;
 }
 
-
-void ra_append_copy(roaring_array_t *ra, roaring_array_t *sa, uint16_t index, bool copy_on_write) {
+void ra_append_copy(roaring_array_t *ra, const roaring_array_t *sa,
+                    uint16_t index, bool copy_on_write) {
     extend_array(ra, 1);
     const int32_t pos = ra->size;
 
     // old contents is junk not needing freeing
     ra->keys[pos] = sa->keys[index];
     // the shared container will be in two bitmaps
-    if(copy_on_write) {
-      sa->containers[index] = get_copy_of_container(sa->containers[index], &sa->typecodes[index],copy_on_write);
-      ra->containers[pos] = sa->containers[index];
-      ra->typecodes[pos] = sa->typecodes[index];
+    if (copy_on_write) {
+        sa->containers[index] = get_copy_of_container(
+            sa->containers[index], &sa->typecodes[index], copy_on_write);
+        ra->containers[pos] = sa->containers[index];
+        ra->typecodes[pos] = sa->typecodes[index];
     } else {
-      ra->containers[pos] =
-        container_clone(sa->containers[index], sa->typecodes[index]);
-            ra->typecodes[pos] = sa->typecodes[index];
-      }
+        ra->containers[pos] =
+            container_clone(sa->containers[index], sa->typecodes[index]);
+        ra->typecodes[pos] = sa->typecodes[index];
+    }
     ra->size++;
 }
 
-
-void ra_append_copies_until(roaring_array_t *ra, roaring_array_t *sa,
+void ra_append_copies_until(roaring_array_t *ra, const roaring_array_t *sa,
                             uint16_t stopping_key, bool copy_on_write) {
-    for (uint16_t i = 0; i < sa->size; ++i) {
+    for (int32_t i = 0; i < sa->size; ++i) {
         if (sa->keys[i] >= stopping_key) break;
         ra_append_copy(ra, sa, i, copy_on_write);
     }
 }
 
-void ra_append_copy_range(roaring_array_t *ra, roaring_array_t *sa,
-                          uint16_t start_index, uint16_t end_index, bool copy_on_write) {
+void ra_append_copy_range(roaring_array_t *ra, const roaring_array_t *sa,
+                          int32_t start_index, int32_t end_index,
+                          bool copy_on_write) {
     extend_array(ra, end_index - start_index);
-
-    for (uint16_t i = start_index; i < end_index; ++i) {
+    for (int32_t i = start_index; i < end_index; ++i) {
         const int32_t pos = ra->size;
         ra->keys[pos] = sa->keys[i];
-if(copy_on_write) {
-    	sa->containers[i] = get_copy_of_container(sa->containers[i], &sa->typecodes[i],copy_on_write);
-        ra->containers[pos] = sa->containers[i];
-        ra->typecodes[pos] = sa->typecodes[i];
-} else {
-        ra->containers[pos] =
-            container_clone(sa->containers[i], sa->typecodes[i]);
-        ra->typecodes[pos] = sa->typecodes[i];
-          }
+        if (copy_on_write) {
+            sa->containers[i] = get_copy_of_container(
+                sa->containers[i], &sa->typecodes[i], copy_on_write);
+            ra->containers[pos] = sa->containers[i];
+            ra->typecodes[pos] = sa->typecodes[i];
+        } else {
+            ra->containers[pos] =
+                container_clone(sa->containers[i], sa->typecodes[i]);
+            ra->typecodes[pos] = sa->typecodes[i];
+        }
         ra->size++;
     }
 }
 
-void ra_append_copies_after(roaring_array_t *ra, roaring_array_t *sa,
+void ra_append_copies_after(roaring_array_t *ra, const roaring_array_t *sa,
                             uint16_t before_start, bool copy_on_write) {
     int start_location = ra_get_index(sa, before_start);
     if (start_location >= 0)
         ++start_location;
     else
         start_location = -start_location - 1;
-    ra_append_copy_range(ra, sa, start_location,sa->size,copy_on_write);
+    ra_append_copy_range(ra, sa, start_location, sa->size, copy_on_write);
 }
 
 void ra_append_move_range(roaring_array_t *ra, roaring_array_t *sa,
-                          uint16_t start_index, uint16_t end_index) {
+                          int32_t start_index, int32_t end_index) {
     extend_array(ra, end_index - start_index);
 
-    for (uint16_t i = start_index; i < end_index; ++i) {
+    for (int32_t i = start_index; i < end_index; ++i) {
         const int32_t pos = ra->size;
 
         ra->keys[pos] = sa->keys[i];
@@ -234,21 +319,23 @@ void ra_append_move_range(roaring_array_t *ra, roaring_array_t *sa,
 }
 
 void ra_append_range(roaring_array_t *ra, roaring_array_t *sa,
-                          uint16_t start_index, uint16_t end_index, bool copy_on_write) {
+                     int32_t start_index, int32_t end_index,
+                     bool copy_on_write) {
     extend_array(ra, end_index - start_index);
 
-    for (uint16_t i = start_index; i < end_index; ++i) {
+    for (int32_t i = start_index; i < end_index; ++i) {
         const int32_t pos = ra->size;
         ra->keys[pos] = sa->keys[i];
-        if(copy_on_write) {
-    	sa->containers[i] = get_copy_of_container(sa->containers[i], &sa->typecodes[i],copy_on_write);
-        ra->containers[pos] = sa->containers[i];
-        ra->typecodes[pos] = sa->typecodes[i];
-} else {
-        ra->containers[pos] =
-            container_clone(sa->containers[i], sa->typecodes[i]);
-                    ra->typecodes[pos] = sa->typecodes[i];
-          }
+        if (copy_on_write) {
+            sa->containers[i] = get_copy_of_container(
+                sa->containers[i], &sa->typecodes[i], copy_on_write);
+            ra->containers[pos] = sa->containers[i];
+            ra->typecodes[pos] = sa->typecodes[i];
+        } else {
+            ra->containers[pos] =
+                container_clone(sa->containers[i], sa->typecodes[i]);
+            ra->typecodes[pos] = sa->typecodes[i];
+        }
         ra->size++;
     }
 }
@@ -260,15 +347,11 @@ void *ra_get_container(roaring_array_t *ra, uint16_t x, uint8_t *typecode) {
     return ra->containers[i];
 }
 
-void *ra_get_container_at_index(roaring_array_t *ra, uint16_t i,
+extern inline void *ra_get_container_at_index(const roaring_array_t *ra, uint16_t i,
+                                       uint8_t *typecode);
+
+void *ra_get_writable_container(roaring_array_t *ra, uint16_t x,
                                 uint8_t *typecode) {
-    assert(i < ra->size);
-    *typecode = ra->typecodes[i];
-    return ra->containers[i];
-}
-
-
-void *ra_get_writable_container(roaring_array_t *ra, uint16_t x, uint8_t *typecode) {
     int i = binarySearch(ra->keys, (int32_t)ra->size, x);
     if (i < 0) return NULL;
     *typecode = ra->typecodes[i];
@@ -276,27 +359,21 @@ void *ra_get_writable_container(roaring_array_t *ra, uint16_t x, uint8_t *typeco
 }
 
 void *ra_get_writable_container_at_index(roaring_array_t *ra, uint16_t i,
-                                uint8_t *typecode) {
+                                         uint8_t *typecode) {
     assert(i < ra->size);
     *typecode = ra->typecodes[i];
     return get_writable_copy_if_shared(ra->containers[i], typecode);
 }
 
-uint16_t ra_get_key_at_index(roaring_array_t *ra, uint16_t i) {
+uint16_t ra_get_key_at_index(const roaring_array_t *ra, uint16_t i) {
     return ra->keys[i];
 }
 
-int32_t ra_get_index(roaring_array_t *ra, uint16_t x) {
-    // TODO: next line is possibly unsafe
-    if ((ra->size == 0) || ra->keys[ra->size - 1] == x) return ra->size - 1;
+extern inline int32_t ra_get_index(const roaring_array_t *ra, uint16_t x);
 
-    return binarySearch(ra->keys, (int32_t)ra->size, x);
-}
+extern inline int32_t ra_advance_until(const roaring_array_t *ra, uint16_t x,
+                                int32_t pos);
 
-extern int32_t ra_advance_until(roaring_array_t *ra, uint16_t x, int32_t pos);
-
-
-/////////////////
 // everything skipped over is freed
 int32_t ra_advance_until_freeing(roaring_array_t *ra, uint16_t x, int32_t pos) {
     while (pos < ra->size && ra->keys[pos] < x) {
@@ -333,7 +410,6 @@ void ra_downsize(roaring_array_t *ra, int32_t new_length) {
 }
 
 void ra_remove_at_index(roaring_array_t *ra, int32_t i) {
-    container_free(ra->containers[i], ra->typecodes[i]);
     memmove(&(ra->containers[i]), &(ra->containers[i + 1]),
             sizeof(void *) * (ra->size - i - 1));
     memmove(&(ra->keys[i]), &(ra->keys[i + 1]),
@@ -343,25 +419,24 @@ void ra_remove_at_index(roaring_array_t *ra, int32_t i) {
     ra->size--;
 }
 
-
+void ra_remove_at_index_and_free(roaring_array_t *ra, int32_t i) {
+    container_free(ra->containers[i], ra->typecodes[i]);
+    ra_remove_at_index(ra, i);
+}
 
 // used in inplace andNot only, to slide left the containers from
 // the mutated RoaringBitmap that are after the largest container of
-// the argument RoaringBitmap.  It is followed by a call to resize.
+// the argument RoaringBitmap.  In use it should be followed by a call to
+// downsize.
 //
 void ra_copy_range(roaring_array_t *ra, uint32_t begin, uint32_t end,
                    uint32_t new_begin) {
-    static bool warned_em = false;
-    if (!warned_em) {
-        fprintf(stderr, "[Warning] potential memory leak in ra_copy_range");
-        warned_em = true;
-    }
     assert(begin <= end);
     assert(new_begin < begin);
 
     const int range = end - begin;
 
-    // TODO: there is a memory leak here, for any overwritten containers
+    // We ensure to previously have freed overwritten containers
     // that are not copied elsewhere
 
     memmove(&(ra->containers[new_begin]), &(ra->containers[begin]),
@@ -372,227 +447,140 @@ void ra_copy_range(roaring_array_t *ra, uint32_t begin, uint32_t end,
             sizeof(uint8_t) * range);
 }
 
-void ra_set_container_at_index(roaring_array_t *ra, int32_t i, void *c,
-                               uint8_t typecode) {
-    assert(i < ra->size);
-    // valid container there already
-    // container_free(ra->containers[i], ra->typecodes[i]);// too eager!
-    // is there a possible memory leak here?
-
-    ra->containers[i] = c;
-    ra->typecodes[i] = typecode;
-}
-
-void ra_replace_key_and_container_at_index(roaring_array_t *ra, int32_t i,
-                                           uint16_t key, void *c,
-                                           uint8_t typecode) {
-    assert(i < ra->size);
-    // container_free(ra->containers[i], ra->typecodes[i]);//too eager!
-    // is there a possible memory leak here, then?
-
-    // anyone calling this is responsible for making sure we have freed the
-    // container currently at the index,
-    // (unless it is the same one we are writing in)
-
-    // possibly we just need to avoid free if c == ra->containers[i] but
-    // otherwise do it.
-
-    ra->keys[i] = key;
-    ra->containers[i] = c;
-    ra->typecodes[i] = typecode;
-}
-
-// just for debugging use
-void show_structure(roaring_array_t *ra) {
-    for (int i = 0; i < ra->size; ++i) {
-        printf(" i=%d\n", i);
-        fflush(stdout);
-
-        printf("Container %d has key %d and its type is %s  of card %d\n", i,
-               (int)ra->keys[i], get_full_container_name(ra->containers[i],ra->typecodes[i]),
-               container_get_cardinality(ra->containers[i], ra->typecodes[i]));
+void ra_shift_tail(roaring_array_t *ra, int32_t count, int32_t distance) {
+    if (distance > 0) {
+        extend_array(ra, distance);
     }
+    int32_t srcpos = ra->size - count;
+    int32_t dstpos = srcpos + distance;
+    memmove(&(ra->keys[dstpos]), &(ra->keys[srcpos]),
+            sizeof(uint16_t) * count);
+    memmove(&(ra->containers[dstpos]), &(ra->containers[srcpos]),
+            sizeof(void *) * count);
+    memmove(&(ra->typecodes[dstpos]), &(ra->typecodes[srcpos]),
+            sizeof(uint8_t) * count);
+    ra->size += distance;
 }
 
-char *ra_serialize(roaring_array_t *ra, uint32_t *serialize_len,
-                   uint8_t *retry_with_array) {
-    uint32_t off, l,
-        cardinality = 0,
-        tot_len =
-            1 /* initial byte type */ +4 /* tot_len */ + sizeof(roaring_array_t) +
-            ra->size * (sizeof(uint16_t) + sizeof(void *) + sizeof(uint8_t));
-    char *out;
-    uint16_t *lens;
 
-    (*retry_with_array) = 0;
-    /* [ 32 bit length ] [ serialization bytes ] */
-    if ((lens = (uint16_t *)malloc(sizeof(int16_t) * ra->size)) == NULL) {
-        *serialize_len = 0;
-        return (NULL);
-    }
-
+size_t ra_size_in_bytes(roaring_array_t *ra) {
+    size_t cardinality = 0;
+    size_t tot_len =
+        1 /* initial byte type */ + 4 /* tot_len */ + sizeof(roaring_array_t) +
+        ra->size * (sizeof(uint16_t) + sizeof(void *) + sizeof(uint8_t));
     for (int32_t i = 0; i < ra->size; i++) {
-        lens[i] =
-            container_serialization_len(ra->containers[i], ra->typecodes[i]);
-
-        assert(lens[i] != 0);
-        tot_len += (lens[i] + sizeof(lens[i]));
+        tot_len +=
+            (container_serialization_len(ra->containers[i], ra->typecodes[i]) +
+             sizeof(uint16_t));
         cardinality +=
             container_get_cardinality(ra->containers[i], ra->typecodes[i]);
     }
 
-    if ((cardinality * sizeof(uint32_t)) < tot_len) {
-        *retry_with_array = 1;
-        free(lens);
-        return (NULL);
+    if ((cardinality * sizeof(uint32_t) + sizeof(uint32_t)) < tot_len) {
+        return cardinality * sizeof(uint32_t) + 1 + sizeof(uint32_t);
     }
-
-    out = (char *)malloc(tot_len);
-
-    if (out == NULL) {
-        free(lens);
-        *serialize_len = 0;
-        return (NULL);
-    } else
-        *serialize_len = tot_len;
-
-    /* Leave room for the first byte */
-    out[0] = SERIALIZATION_CONTAINER, off = 1;
-
-    /* Total lenght (first 4 bytes of the serialization) */
-    memcpy(out + off, &tot_len, 4), off += 4;
-
-    l = sizeof(roaring_array_t);
-    uint32_t saved_allocation_size = ra->allocation_size;
-
-    ra->allocation_size = ra->size;
-    memcpy(&out[off], ra, l);
-    ra->allocation_size = saved_allocation_size;
-    off += l;
-
-    l = ra->size * sizeof(uint16_t);
-    memcpy(&out[off], ra->keys, l);
-    off += l;
-
-    l = ra->size * sizeof(void *);
-    memcpy(&out[off], ra->containers, l);
-    off += l;
-
-    l = ra->size * sizeof(uint8_t);
-    memcpy(&out[off], ra->typecodes, l);
-    off += l;
-
-    for (int32_t i = 0; i < ra->size; i++) {
-        int32_t serialized_bytes;
-
-        memcpy(&out[off], &lens[i], sizeof(lens[i]));
-        off += sizeof(lens[i]);
-        serialized_bytes =
-            container_serialize(ra->containers[i], ra->typecodes[i], &out[off]);
-
-        if (serialized_bytes != lens[i]) {
-            for (int32_t j = 0; j <= i; j++)
-                container_free(ra->containers[j], ra->typecodes[j]);
-
-            free(lens);
-            free(out);
-            assert(serialized_bytes != lens[i]);
-            return (NULL);
-        }
-
-        off += serialized_bytes;
-    }
-
-    if (tot_len != off) {
-        assert(tot_len != off);
-    }
-
-    free(lens);
-
-    return (out);
+    return tot_len;
 }
 
-roaring_array_t *ra_deserialize(const void *buf, uint32_t buf_len) {
-    int32_t size;
-    const char *bufaschar = (const char *)buf;
-    memcpy(&size, bufaschar, sizeof(int32_t));
-    roaring_array_t *ra_copy;
-    uint32_t off, l;
-    uint32_t expected_len =
-        sizeof(roaring_array_t) +
-        size * (sizeof(uint16_t) + sizeof(void *) + sizeof(uint8_t));
-
-    if (buf_len < expected_len) return (NULL);
-
-    if ((ra_copy = (roaring_array_t *)malloc(sizeof(roaring_array_t))) == NULL)
-        return (NULL);
-
-    memcpy(ra_copy, bufaschar, off = sizeof(roaring_array_t));
-
-    if ((ra_copy->keys = malloc(size * sizeof(uint16_t))) == NULL) {
-        free(ra_copy);
-        return (NULL);
+void ra_to_uint32_array(const roaring_array_t *ra, uint32_t *ans) {
+    size_t ctr = 0;
+    for (int32_t i = 0; i < ra->size; ++i) {
+        int num_added = container_to_uint32_array(
+            ans + ctr, ra->containers[i], ra->typecodes[i],
+            ((uint32_t)ra->keys[i]) << 16);
+        ctr += num_added;
     }
-
-    if ((ra_copy->containers = malloc(size * sizeof(void *))) == NULL) {
-        free(ra_copy->keys);
-        free(ra_copy);
-        return (NULL);
-    }
-
-    if ((ra_copy->typecodes = malloc(size * sizeof(uint8_t))) == NULL) {
-        free(ra_copy->containers);
-        free(ra_copy->keys);
-        free(ra_copy);
-        return (NULL);
-    }
-
-    l = size * sizeof(uint16_t);
-    memcpy(ra_copy->keys, &bufaschar[off], l);
-    off += l;
-
-    l = size * sizeof(void *);
-    memcpy(ra_copy->containers, &bufaschar[off], l);
-    off += l;
-
-    l = size * sizeof(uint8_t);
-    memcpy(ra_copy->typecodes, &bufaschar[off], l);
-    off += l;
-
-    for (int32_t i = 0; i < size; i++) {
-        uint16_t len;
-
-        memcpy(&len, &bufaschar[off], sizeof(len));
-        off += sizeof(len);
-
-        ra_copy->containers[i] =
-            container_deserialize(ra_copy->typecodes[i], &bufaschar[off], len);
-
-        if (ra_copy->containers[i] == NULL) {
-            for (int32_t j = 0; j < i; j++)
-                container_free(ra_copy->containers[j], ra_copy->typecodes[j]);
-
-            free(ra_copy->containers);
-            free(ra_copy->keys);
-            free(ra_copy);
-            return (NULL);
-        }
-
-        off += len;
-    }
-
-    return (ra_copy);
 }
 
-bool ra_has_run_container(roaring_array_t *ra) {
+bool ra_range_uint32_array(const roaring_array_t *ra, size_t offset, size_t limit, uint32_t *ans) {
+    size_t ctr = 0;
+    size_t dtr = 0;
+
+    size_t t_limit = 0;
+
+    bool first = false;
+    size_t first_skip = 0;
+
+    uint32_t *t_ans = NULL;
+    size_t cur_len = 0;
+
+    for (int i = 0; i < ra->size; ++i) {
+
+        const void *container = container_unwrap_shared(ra->containers[i], &ra->typecodes[i]);
+        switch (ra->typecodes[i]) {
+            case BITSET_CONTAINER_TYPE_CODE:
+                t_limit = ((const bitset_container_t *)container)->cardinality;
+                break;
+            case ARRAY_CONTAINER_TYPE_CODE:
+                t_limit = ((const array_container_t *)container)->cardinality;
+                break;
+            case RUN_CONTAINER_TYPE_CODE:
+                t_limit = run_container_cardinality((const run_container_t *)container);
+                break;
+        }
+        if (ctr + t_limit - 1 >= offset && ctr < offset + limit){
+            if (!first){
+                //first_skip = t_limit - (ctr + t_limit - offset);
+                first_skip = offset - ctr;
+                first = true;
+                t_ans = (uint32_t *)malloc(sizeof(*t_ans) * (first_skip + limit));
+                if(t_ans == NULL) {
+                  return false;
+                }
+                memset(t_ans, 0, sizeof(*t_ans) * (first_skip + limit)) ;
+                cur_len = first_skip + limit;
+            }
+            if (dtr + t_limit > cur_len){
+                uint32_t * append_ans = (uint32_t *)malloc(sizeof(*append_ans) * (cur_len + t_limit));
+                if(append_ans == NULL) {
+                  if(t_ans != NULL) free(t_ans);
+                  return false;
+                }
+                memset(append_ans, 0, sizeof(*append_ans) * (cur_len + t_limit));
+                cur_len = cur_len + t_limit;
+                memcpy(append_ans, t_ans, dtr * sizeof(uint32_t));
+                free(t_ans);
+                t_ans = append_ans;
+            }
+            switch (ra->typecodes[i]) {
+                case BITSET_CONTAINER_TYPE_CODE:
+                    container_to_uint32_array(
+                        t_ans + dtr, (const bitset_container_t *)container,  ra->typecodes[i],
+                        ((uint32_t)ra->keys[i]) << 16);
+                    break;
+                case ARRAY_CONTAINER_TYPE_CODE:
+                    container_to_uint32_array(
+                        t_ans + dtr, (const array_container_t *)container, ra->typecodes[i],
+                        ((uint32_t)ra->keys[i]) << 16);
+                    break;
+                case RUN_CONTAINER_TYPE_CODE:
+                    container_to_uint32_array(
+                        t_ans + dtr, (const run_container_t *)container, ra->typecodes[i],
+                        ((uint32_t)ra->keys[i]) << 16);
+                    break;
+            }
+            dtr += t_limit;
+        }
+        ctr += t_limit;
+        if (dtr-first_skip >= limit) break;
+    }
+    if(t_ans != NULL) {
+      memcpy(ans, t_ans+first_skip, limit * sizeof(uint32_t));
+      free(t_ans);
+    }
+    return true;
+}
+
+bool ra_has_run_container(const roaring_array_t *ra) {
     for (int32_t k = 0; k < ra->size; ++k) {
-        if (get_container_type(ra->containers[k],ra->typecodes[k])
-        		== RUN_CONTAINER_TYPE_CODE) return true;
+        if (get_container_type(ra->containers[k], ra->typecodes[k]) ==
+            RUN_CONTAINER_TYPE_CODE)
+            return true;
     }
     return false;
 }
 
-uint32_t ra_portable_header_size(roaring_array_t *ra) {
+uint32_t ra_portable_header_size(const roaring_array_t *ra) {
     if (ra_has_run_container(ra)) {
         if (ra->size <
             NO_OFFSET_THRESHOLD) {  // for small bitmaps, we omit the offsets
@@ -605,7 +593,7 @@ uint32_t ra_portable_header_size(roaring_array_t *ra) {
     }
 }
 
-size_t ra_portable_size_in_bytes(roaring_array_t *ra) {
+size_t ra_portable_size_in_bytes(const roaring_array_t *ra) {
     size_t count = ra_portable_header_size(ra);
 
     for (int32_t k = 0; k < ra->size; ++k) {
@@ -614,8 +602,7 @@ size_t ra_portable_size_in_bytes(roaring_array_t *ra) {
     return count;
 }
 
-size_t ra_portable_serialize(roaring_array_t *ra, char *buf) {
-    assert(!IS_BIG_ENDIAN);  // not implemented
+size_t ra_portable_serialize(const roaring_array_t *ra, char *buf) {
     char *initbuf = buf;
     uint32_t startOffset = 0;
     bool hasrun = ra_has_run_container(ra);
@@ -624,11 +611,11 @@ size_t ra_portable_serialize(roaring_array_t *ra, char *buf) {
         memcpy(buf, &cookie, sizeof(cookie));
         buf += sizeof(cookie);
         uint32_t s = (ra->size + 7) / 8;
-        uint8_t *bitmapOfRunContainers = calloc(s, 1);
+        uint8_t *bitmapOfRunContainers = (uint8_t *)calloc(s, 1);
         assert(bitmapOfRunContainers != NULL);  // todo: handle
         for (int32_t i = 0; i < ra->size; ++i) {
-            if (get_container_type(ra->containers[i],ra->typecodes[i])
-            		== RUN_CONTAINER_TYPE_CODE) {
+            if (get_container_type(ra->containers[i], ra->typecodes[i]) ==
+                RUN_CONTAINER_TYPE_CODE) {
                 bitmapOfRunContainers[i / 8] |= (1 << (i % 8));
             }
         }
@@ -653,9 +640,10 @@ size_t ra_portable_serialize(roaring_array_t *ra, char *buf) {
     for (int32_t k = 0; k < ra->size; ++k) {
         memcpy(buf, &ra->keys[k], sizeof(ra->keys[k]));
         buf += sizeof(ra->keys[k]);
-
-        uint16_t card =
-            container_get_cardinality(ra->containers[k], ra->typecodes[k]) - 1;
+        // get_cardinality returns a value in [1,1<<16], subtracting one
+        // we get [0,1<<16 - 1] which fits in 16 bits
+        uint16_t card = (uint16_t)(
+            container_get_cardinality(ra->containers[k], ra->typecodes[k]) - 1);
         memcpy(buf, &card, sizeof(card));
         buf += sizeof(card);
     }
@@ -675,95 +663,257 @@ size_t ra_portable_serialize(roaring_array_t *ra, char *buf) {
     return buf - initbuf;
 }
 
-roaring_array_t *ra_portable_deserialize(const char *buf) {
-    assert(!IS_BIG_ENDIAN);  // not implemented
+// Quickly checks whether there is a serialized bitmap at the pointer,
+// not exceeding size "maxbytes" in bytes. This function does not allocate
+// memory dynamically.
+//
+// This function returns 0 if and only if no valid bitmap is found.
+// Otherwise, it returns how many bytes are occupied.
+//
+size_t ra_portable_deserialize_size(const char *buf, const size_t maxbytes) {
+    size_t bytestotal = sizeof(int32_t);// for cookie
+    if(bytestotal > maxbytes) return 0;
     uint32_t cookie;
     memcpy(&cookie, buf, sizeof(int32_t));
     buf += sizeof(uint32_t);
     if ((cookie & 0xFFFF) != SERIAL_COOKIE &&
         cookie != SERIAL_COOKIE_NO_RUNCONTAINER) {
-        fprintf(stderr, "I failed to find one of the right cookies. Found %d\n",
-                cookie);
-        return NULL;
+        return 0;
     }
     int32_t size;
 
     if ((cookie & 0xFFFF) == SERIAL_COOKIE)
         size = (cookie >> 16) + 1;
     else {
+        bytestotal += sizeof(int32_t);
+        if(bytestotal > maxbytes) return 0;
         memcpy(&size, buf, sizeof(int32_t));
         buf += sizeof(uint32_t);
     }
-    roaring_array_t *answer = ra_create_with_capacity(size);
-    if (answer == NULL) {
-        fprintf(stderr, "Failed to allocate memory early on. Bailing out.\n");
-        return answer;
+    if (size > (1<<16)) {
+       return 0; // logically impossible
     }
-    answer->size = size;
     char *bitmapOfRunContainers = NULL;
     bool hasrun = (cookie & 0xFFFF) == SERIAL_COOKIE;
     if (hasrun) {
         int32_t s = (size + 7) / 8;
-        bitmapOfRunContainers = malloc((size + 7) / 8);
-        assert(bitmapOfRunContainers != NULL);  // todo: handle
-        memcpy(bitmapOfRunContainers, buf, s);
+        bytestotal += s;
+        if(bytestotal > maxbytes) return 0;
+        bitmapOfRunContainers = (char *)buf;
         buf += s;
     }
-    uint16_t *keys = answer->keys;
-    int32_t *cardinalities = malloc(size * sizeof(int32_t));
-    assert(cardinalities != NULL);  // todo: handle
-    bool *isBitmap = malloc(size * sizeof(bool));
-    assert(isBitmap != NULL);  // todo: handle
-    uint16_t tmp;
+    bytestotal += size * 2 * sizeof(uint16_t);
+    if(bytestotal > maxbytes) return 0;
+    uint16_t *keyscards = (uint16_t *)buf;
+    buf += size * 2 * sizeof(uint16_t);
+    if ((!hasrun) || (size >= NO_OFFSET_THRESHOLD)) {
+        // skipping the offsets
+        bytestotal += size * 4;
+        if(bytestotal > maxbytes) return 0;
+        buf += size * 4;
+    }
+    // Reading the containers
     for (int32_t k = 0; k < size; ++k) {
-        memcpy(&keys[k], buf, sizeof(keys[k]));
-        buf += sizeof(keys[k]);
-        memcpy(&tmp, buf, sizeof(tmp));
-        buf += sizeof(tmp);
-        cardinalities[k] = 1 + tmp;
-        isBitmap[k] = cardinalities[k] > DEFAULT_MAX_SIZE;
-        if (bitmapOfRunContainers != NULL &&
-            (bitmapOfRunContainers[k / 8] & (1 << (k % 8))) != 0) {
-            isBitmap[k] = false;
+        uint16_t tmp;
+        memcpy(&tmp, keyscards + 2*k+1, sizeof(tmp));
+        uint32_t thiscard = tmp + 1;
+        bool isbitmap = (thiscard > DEFAULT_MAX_SIZE);
+        bool isrun = false;
+        if(hasrun) {
+          if((bitmapOfRunContainers[k / 8] & (1 << (k % 8))) != 0) {
+            isbitmap = false;
+            isrun = true;
+          }
+        }
+        if (isbitmap) {
+            size_t containersize = BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
+            bytestotal += containersize;
+            if(bytestotal > maxbytes) return 0;
+            buf += containersize;
+        } else if (isrun) {
+            bytestotal += sizeof(uint16_t);
+            if(bytestotal > maxbytes) return 0;
+            uint16_t n_runs;
+            memcpy(&n_runs, buf, sizeof(uint16_t));
+            buf += sizeof(uint16_t);
+            size_t containersize = n_runs * sizeof(rle16_t);
+            bytestotal += containersize;
+            if(bytestotal > maxbytes) return 0;
+            buf += containersize;
+        } else {
+            size_t containersize = thiscard * sizeof(uint16_t);
+            bytestotal += containersize;
+            if(bytestotal > maxbytes) return 0;
+            buf += containersize;
         }
     }
+    return bytestotal;
+}
+
+
+// this function populates answer from the content of buf (reading up to maxbytes bytes).
+// The function returns false if a properly serialized bitmap cannot be found.
+// if it returns true, readbytes is populated by how many bytes were read, we have that *readbytes <= maxbytes.
+bool ra_portable_deserialize(roaring_array_t *answer, const char *buf, const size_t maxbytes, size_t * readbytes) {
+    *readbytes = sizeof(int32_t);// for cookie
+    if(*readbytes > maxbytes) {
+      fprintf(stderr, "Ran out of bytes while reading first 4 bytes.\n");
+      return false;
+    }
+    uint32_t cookie;
+    memcpy(&cookie, buf, sizeof(int32_t));
+    buf += sizeof(uint32_t);
+    if ((cookie & 0xFFFF) != SERIAL_COOKIE &&
+        cookie != SERIAL_COOKIE_NO_RUNCONTAINER) {
+        fprintf(stderr, "I failed to find one of the right cookies. Found %" PRIu32 "\n",
+                cookie);
+        return false;
+    }
+    int32_t size;
+
+    if ((cookie & 0xFFFF) == SERIAL_COOKIE)
+        size = (cookie >> 16) + 1;
+    else {
+        *readbytes += sizeof(int32_t);
+        if(*readbytes > maxbytes) {
+          fprintf(stderr, "Ran out of bytes while reading second part of the cookie.\n");
+          return false;
+        }
+        memcpy(&size, buf, sizeof(int32_t));
+        buf += sizeof(uint32_t);
+    }
+    if (size > (1<<16)) {
+       fprintf(stderr, "You cannot have so many containers, the data must be corrupted: %" PRId32 "\n",
+                size);
+       return false; // logically impossible
+    }
+    const char *bitmapOfRunContainers = NULL;
+    bool hasrun = (cookie & 0xFFFF) == SERIAL_COOKIE;
+    if (hasrun) {
+        int32_t s = (size + 7) / 8;
+        *readbytes += s;
+        if(*readbytes > maxbytes) {// data is corrupted?
+          fprintf(stderr, "Ran out of bytes while reading run bitmap.\n");
+          return false;
+        }
+        bitmapOfRunContainers = buf;
+        buf += s;
+    }
+    uint16_t *keyscards = (uint16_t *)buf;
+
+    *readbytes += size * 2 * sizeof(uint16_t);
+    if(*readbytes > maxbytes) {
+      fprintf(stderr, "Ran out of bytes while reading key-cardinality array.\n");
+      return false;
+    }
+    buf += size * 2 * sizeof(uint16_t);
+
+    bool is_ok = ra_init_with_capacity(answer, size);
+    if (!is_ok) {
+        fprintf(stderr, "Failed to allocate memory for roaring array. Bailing out.\n");
+        return false;
+    }
+
+    for (int32_t k = 0; k < size; ++k) {
+        uint16_t tmp;
+        memcpy(&tmp, keyscards + 2*k, sizeof(tmp));
+        answer->keys[k] = tmp;
+    }
     if ((!hasrun) || (size >= NO_OFFSET_THRESHOLD)) {
+        *readbytes += size * 4;
+        if(*readbytes > maxbytes) {// data is corrupted?
+          fprintf(stderr, "Ran out of bytes while reading offsets.\n");
+          ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+          return false;
+        }
+
         // skipping the offsets
         buf += size * 4;
     }
     // Reading the containers
     for (int32_t k = 0; k < size; ++k) {
-        if (isBitmap[k]) {
+        uint16_t tmp;
+        memcpy(&tmp, keyscards + 2*k+1, sizeof(tmp));
+        uint32_t thiscard = tmp + 1;
+        bool isbitmap = (thiscard > DEFAULT_MAX_SIZE);
+        bool isrun = false;
+        if(hasrun) {
+          if((bitmapOfRunContainers[k / 8] & (1 << (k % 8))) != 0) {
+            isbitmap = false;
+            isrun = true;
+          }
+        }
+        if (isbitmap) {
+            // we check that the read is allowed
+            size_t containersize = BITSET_CONTAINER_SIZE_IN_WORDS * sizeof(uint64_t);
+            *readbytes += containersize;
+            if(*readbytes > maxbytes) {
+              fprintf(stderr, "Running out of bytes while reading a bitset container.\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            // it is now safe to read
             bitset_container_t *c = bitset_container_create();
-            assert(c != NULL);  // todo: handle
-            buf += bitset_container_read(cardinalities[k], c, buf);
+            if(c == NULL) {// memory allocation failure
+              fprintf(stderr, "Failed to allocate memory for a bitset container.\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            answer->size++;
+            buf += bitset_container_read(thiscard, c, buf);
             answer->containers[k] = c;
             answer->typecodes[k] = BITSET_CONTAINER_TYPE_CODE;
-        } else if (bitmapOfRunContainers != NULL &&
-                   ((bitmapOfRunContainers[k / 8] & (1 << (k % 8))) != 0)) {
+        } else if (isrun) {
+            // we check that the read is allowed
+            *readbytes += sizeof(uint16_t);
+            if(*readbytes > maxbytes) {
+              fprintf(stderr, "Running out of bytes while reading a run container (header).\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            uint16_t n_runs;
+            memcpy(&n_runs, buf, sizeof(uint16_t));
+            size_t containersize = n_runs * sizeof(rle16_t);
+            *readbytes += containersize;
+            if(*readbytes > maxbytes) {// data is corrupted?
+              fprintf(stderr, "Running out of bytes while reading a run container.\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            // it is now safe to read
+
             run_container_t *c = run_container_create();
-            assert(c != NULL);  // todo: handle
-            buf += run_container_read(cardinalities[k], c, buf);
+            if(c == NULL) {// memory allocation failure
+              fprintf(stderr, "Failed to allocate memory for a run container.\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            answer->size++;
+            buf += run_container_read(thiscard, c, buf);
             answer->containers[k] = c;
             answer->typecodes[k] = RUN_CONTAINER_TYPE_CODE;
         } else {
+            // we check that the read is allowed
+            size_t containersize = thiscard * sizeof(uint16_t);
+            *readbytes += containersize;
+            if(*readbytes > maxbytes) {// data is corrupted?
+              fprintf(stderr, "Running out of bytes while reading an array container.\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            // it is now safe to read
             array_container_t *c =
-                array_container_create_given_capacity(cardinalities[k]);
-            assert(c != NULL);  // todo: handle
-            buf += array_container_read(cardinalities[k], c, buf);
+                array_container_create_given_capacity(thiscard);
+            if(c == NULL) {// memory allocation failure
+              fprintf(stderr, "Failed to allocate memory for an array container.\n");
+              ra_clear(answer);// we need to clear the containers already allocated, and the roaring array
+              return false;
+            }
+            answer->size++;
+            buf += array_container_read(thiscard, c, buf);
             answer->containers[k] = c;
             answer->typecodes[k] = ARRAY_CONTAINER_TYPE_CODE;
         }
     }
-    free(bitmapOfRunContainers);
-    free(cardinalities);
-    free(isBitmap);
-    return answer;
-}
-
-
-
-void ra_unshare_container_at_index(roaring_array_t *ra, uint16_t i) {
-	assert(i < ra->size);
-        ra->containers[i] = get_writable_copy_if_shared(ra->containers[i],& ra->typecodes[i]);
+    return true;
 }

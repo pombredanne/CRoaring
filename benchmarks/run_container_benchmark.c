@@ -1,16 +1,12 @@
-
-
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-
+#include <roaring/portability.h>
+#include <roaring/containers/run.h>
+#include <roaring/misc/configreport.h>
 #include "benchmark.h"
-#include "containers/run.h"
-#include "misc/configreport.h"
 #include "random.h"
 
 enum { TESTSIZE = 2048 };
 
+#if defined(IS_X64) && !(defined(_MSC_VER) && !defined(__clang__))
 // flushes the array from cache
 void run_cache_flush(run_container_t* B) {
     const int32_t CACHELINESIZE =
@@ -20,15 +16,24 @@ void run_cache_flush(run_container_t* B) {
         __builtin_ia32_clflush(B->runs + k);
     }
 }
+#else
+void run_cache_flush(run_container_t* B) { (void)B; }
+#endif
 
 // tries to put array in cache
 void run_cache_prefetch(run_container_t* B) {
+#ifdef IS_X64
     const int32_t CACHELINESIZE =
         computecacheline();  // 64 bytes per cache line
+#else
+    const int32_t CACHELINESIZE = 64;
+#endif
+#if !(defined(_MSC_VER) && !defined(__clang__))
     for (int32_t k = 0; k < B->n_runs * 2;
          k += CACHELINESIZE / (int32_t)sizeof(uint16_t)) {
         __builtin_prefetch(B->runs + k);
     }
+#endif
 }
 
 int add_test(run_container_t* B) {

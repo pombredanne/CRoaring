@@ -1,13 +1,14 @@
 #define _GNU_SOURCE
+#include <roaring/roaring.h>
 #include "benchmark.h"
 #include "numbersfromtextfiles.h"
-#include "roaring.h"
 
 /**
  * Once you have collected all the integers, build the bitmaps.
  */
 static roaring_bitmap_t **create_all_bitmaps(size_t *howmany,
-                                             uint32_t **numbers, size_t count, bool copy_on_write) {
+                                             uint32_t **numbers, size_t count,
+                                             bool runoptimize, bool copy_on_write) {
     if (numbers == NULL) return NULL;
     printf("Constructing %d  bitmaps.\n", (int)count);
     roaring_bitmap_t **answer = malloc(sizeof(roaring_bitmap_t *) * count);
@@ -15,7 +16,9 @@ static roaring_bitmap_t **create_all_bitmaps(size_t *howmany,
         printf(".");
         fflush(stdout);
         answer[i] = roaring_bitmap_of_ptr(howmany[i], numbers[i]);
-        answer[i]->copy_on_write = copy_on_write;
+        if(runoptimize) roaring_bitmap_run_optimize(answer[i]);
+        roaring_bitmap_shrink_to_fit(answer[i]);
+        roaring_bitmap_set_copy_on_write(answer[i], copy_on_write);
     }
     printf("\n");
     return answer;
@@ -40,8 +43,9 @@ static void printusage(char *command) {
 
 int main(int argc, char **argv) {
     int c;
-    char *extension = ".txt";
+    const char *extension = ".txt";
     bool copy_on_write = false;
+    bool runoptimize = true;
     while ((c = getopt(argc, argv, "e:h")) != -1) switch (c) {
             case 'e':
                 extension = optarg;
@@ -73,7 +77,8 @@ int main(int argc, char **argv) {
     uint64_t cycles_start = 0, cycles_final = 0;
 
     RDTSC_START(cycles_start);
-    roaring_bitmap_t **bitmaps = create_all_bitmaps(howmany, numbers, count, copy_on_write);
+    roaring_bitmap_t **bitmaps =
+        create_all_bitmaps(howmany, numbers, count, runoptimize, copy_on_write);
     RDTSC_FINAL(cycles_final);
     if (bitmaps == NULL) return -1;
     printf("Loaded %d bitmaps from directory %s \n", (int)count, dirname);
@@ -95,15 +100,15 @@ int main(int argc, char **argv) {
     uint64_t successive_or = 0;
     // try ANDing and ORing together consecutive pairs
     for (int i = 0; i < (int)count - 1; ++i) {
-        uint32_t c1 = roaring_bitmap_get_cardinality(bitmaps[i]);
-        uint32_t c2 = roaring_bitmap_get_cardinality(bitmaps[i + 1]);
+        uint32_t c1 = (uint32_t)roaring_bitmap_get_cardinality(bitmaps[i]);
+        uint32_t c2 = (uint32_t)roaring_bitmap_get_cardinality(bitmaps[i + 1]);
         RDTSC_START(cycles_start);
         roaring_bitmap_t *tempand =
             roaring_bitmap_and(bitmaps[i], bitmaps[i + 1]);
         RDTSC_FINAL(cycles_final);
         successive_and += cycles_final - cycles_start;
 
-        uint32_t ci = roaring_bitmap_get_cardinality(tempand);
+        uint32_t ci = (uint32_t)roaring_bitmap_get_cardinality(tempand);
         roaring_bitmap_free(tempand);
         RDTSC_START(cycles_start);
         roaring_bitmap_t *tempor =
@@ -111,7 +116,7 @@ int main(int argc, char **argv) {
         RDTSC_FINAL(cycles_final);
         successive_or += cycles_final - cycles_start;
 
-        uint32_t co = roaring_bitmap_get_cardinality(tempor);
+        uint32_t co = (uint32_t)roaring_bitmap_get_cardinality(tempor);
         roaring_bitmap_free(tempor);
 
         if (c1 + c2 != co + ci) {
@@ -150,6 +155,22 @@ int main(int argc, char **argv) {
     RDTSC_FINAL(cycles_final);
     printf(" %zu successive in-place bitmaps unions took %" PRIu64 " cycles\n",
            count - 1, cycles_final - cycles_start);
+    size_t total_count = 0;
+    RDTSC_START(cycles_start);
+    for (size_t i = 0; i < count; ++i) {
+        roaring_bitmap_t *ra = bitmaps[i];
+        roaring_uint32_iterator_t j;
+        roaring_init_iterator(ra, &j);
+        while (j.has_value) {
+            total_count++;
+            roaring_advance_uint32_iterator(&j);
+        }
+    }
+    RDTSC_FINAL(cycles_final);
+
+    printf("Iterating over %zu bitmaps and %zu values took %" PRIu64
+           " cycles\n",
+           count, total_count, cycles_final - cycles_start);
 
     for (int i = 0; i < (int)count; ++i) {
         free(numbers[i]);

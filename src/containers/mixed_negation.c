@@ -3,21 +3,15 @@
  *
  */
 
-#include "containers/mixed_negation.h"
-#include "bitset_util.h"
-#include "array_util.h"
-#include "containers/run.h"
-#include "containers/containers.h"
-#include "containers/convert.h"
-
 #include <assert.h>
 #include <string.h>
 
-/* code makes the assumption that sizeof(int) > 2
- * for ranges. Could use uint32_t instead if this is undesirable.
- * But it seems silly to worry about 16-bit platforms with this library.
- */
-_Static_assert(sizeof(int) > 2, "ints too small for ranges");
+#include <roaring/array_util.h>
+#include <roaring/bitset_util.h>
+#include <roaring/containers/containers.h>
+#include <roaring/containers/convert.h>
+#include <roaring/containers/mixed_negation.h>
+#include <roaring/containers/run.h>
 
 // TODO: make simplified and optimized negation code across
 // the full range.
@@ -34,8 +28,8 @@ void array_container_negation(const array_container_t *src,
     uint64_t card = UINT64_C(1 << 16);
     bitset_container_set_all(dst);
 
-    dst->cardinality =
-        bitset_clear_list(dst->array, card, src->array, src->cardinality);
+    dst->cardinality = (int32_t)bitset_clear_list(dst->array, card, src->array,
+                                                  (uint64_t)src->cardinality);
 }
 
 /* Negation across the entire range of the container
@@ -125,6 +119,10 @@ bool array_container_negation_range(const array_container_t *src,
     array_container_t *arr =
         array_container_create_given_capacity(new_cardinality);
     *dst = (void *)arr;
+    if(new_cardinality == 0) {
+      arr->cardinality = new_cardinality;
+      return false; // we are done.
+    }
     // copy stuff before the active area
     memcpy(arr->array, src->array, start_index * sizeof(uint16_t));
 

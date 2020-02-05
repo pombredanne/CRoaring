@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "containers/run.h"
+#include <roaring/containers/run.h>
 
 #include "test.h"
 
@@ -143,10 +143,72 @@ void to_uint32_array_test() {
     }
 }
 
+void select_test() {
+    run_container_t* B = run_container_create();
+    assert_non_null(B);
+    uint16_t base = 27;
+    for (uint16_t value = base; value < base + 200; value += 5) {
+        run_container_add(B, value);
+    }
+    uint32_t i = 0;
+    uint32_t element = 0;
+    uint32_t start_rank;
+    for (uint16_t value = base; value < base + 200; value += 5) {
+        start_rank = 12;
+        assert_true(run_container_select(B, &start_rank, i + 12, &element));
+        assert_int_equal(element, value);
+        i++;
+    }
+    start_rank = 12;
+    assert_false(run_container_select(B, &start_rank, i + 12, &element));
+    assert_int_equal(start_rank, i + 12);
+    run_container_free(B);
+}
+
+void remove_range_test() {
+    run_container_t* run = run_container_create();
+    run_container_add_range(run, 100, 150);
+    run_container_add_range(run, 200, 250);
+    run_container_add_range(run, 300, 350);
+
+    // act on left-most run
+    run_container_remove_range(run, 100, 110);
+    run_container_remove_range(run, 140, 150);
+    run_container_remove_range(run, 120, 130);
+
+    // act on right-most run
+    run_container_remove_range(run, 300, 310);
+    run_container_remove_range(run, 340, 350);
+    run_container_remove_range(run, 320, 330);
+
+    // act on inner run
+    run_container_remove_range(run, 200, 210);
+    run_container_remove_range(run, 240, 250);
+    run_container_remove_range(run, 220, 230);
+
+    // [111..119], [131..139], [211..219], [231..239], [311..319], [331..339]
+
+    // remove entire runs
+    run_container_remove_range(run, 111, 119);
+    run_container_remove_range(run, 331, 339);
+    run_container_remove_range(run, 231, 239);
+
+    // [131..139], [211..219], [311..319]
+
+    assert_true(run_container_contains_range(run, 131, 139+1));
+    assert_true(run_container_contains_range(run, 211, 219+1));
+    assert_true(run_container_contains_range(run, 311, 319+1));
+    assert_true(run_container_cardinality(run) == 27);
+
+    run_container_free(run);
+}
+
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(printf_test), cmocka_unit_test(add_contains_test),
         cmocka_unit_test(and_or_test), cmocka_unit_test(to_uint32_array_test),
+        cmocka_unit_test(select_test),
+        cmocka_unit_test(remove_range_test),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

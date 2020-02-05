@@ -7,8 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "containers/array.h"
-#include "misc/configreport.h"
+#include <roaring/containers/array.h>
+#include <roaring/misc/configreport.h>
 
 #include "test.h"
 
@@ -94,7 +94,7 @@ void and_or_test() {
     assert_non_null(BO);
     assert_non_null(TMP);
 
-    for (size_t x = 0; x < (1 << 16); x += 3) {
+    for (size_t x = 0; x < (1 << 16); x += 17) {
         array_container_add(B1, x);
         array_container_add(BI, x);
     }
@@ -105,7 +105,7 @@ void and_or_test() {
         array_container_add(BI, x);
     }
 
-    for (size_t x = 0; x < (1 << 16); x += 62 * 3) {
+    for (size_t x = 0; x < (1 << 16); x += 62 * 17) {
         array_container_add(BO, x);
     }
 
@@ -152,10 +152,47 @@ void to_uint32_array_test() {
     }
 }
 
+void select_test() {
+    array_container_t* B = array_container_create();
+    assert_non_null(B);
+    uint16_t base = 27;
+    for (uint16_t value = base; value < base + 200; value += 5) {
+        array_container_add(B, value);
+    }
+    uint32_t i = 0;
+    uint32_t element = 0;
+    uint32_t start_rank;
+    for (uint16_t value = base; value < base + 200; value += 5) {
+        start_rank = 12;
+        assert_true(array_container_select(B, &start_rank, i + 12, &element));
+        assert_int_equal(element, value);
+        i++;
+    }
+    start_rank = 12;
+    assert_false(array_container_select(B, &start_rank, i + 12, &element));
+    assert_int_equal(start_rank, i + 12);
+    array_container_free(B);
+}
+
+void capacity_test() {
+    array_container_t* array = array_container_create();
+    for (uint32_t i = 0; i < DEFAULT_MAX_SIZE; i++) {
+        array_container_add(array, (uint16_t)i);
+        assert_true(array->capacity <= DEFAULT_MAX_SIZE);
+    }
+    for (uint32_t i = DEFAULT_MAX_SIZE; i < 65536; i++) {
+        array_container_add(array, (uint16_t)i);
+        assert_true(array->capacity <= 65536);
+    }
+    array_container_free(array);
+}
+
 int main() {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(printf_test), cmocka_unit_test(add_contains_test),
         cmocka_unit_test(and_or_test), cmocka_unit_test(to_uint32_array_test),
+        cmocka_unit_test(select_test),
+        cmocka_unit_test(capacity_test)
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

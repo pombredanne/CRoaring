@@ -40,7 +40,7 @@
 #define snprintf _snprintf
 #else /* HAVE__SNPRINTF */
 #if !defined(HAVE_SNPRINTF)
-#error "no snprintf compatible function found"
+#pragma message "no snprintf compatible function found"
 #endif /* HAVE_SNPRINTF */
 #endif /* HAVE__SNPRINTF */
 #endif /* HAVE__SNPRINTF_S */
@@ -54,7 +54,7 @@
 #define vsnprintf _vsnprintf
 #else
 #if !defined(HAVE_VSNPRINTF)
-#error "No vsnprintf compatible function found"
+#pragma message "No vsnprintf compatible function found"
 #endif /* HAVE_VSNPRINTF */
 #endif /* HAVE__VSNPRINTF */
 #endif /* HAVE__VSNPRINTF_S */
@@ -128,7 +128,7 @@ WINBASEAPI BOOL WINAPI IsDebuggerPresent(VOID);
     } while (0)
 
 /** Zero a structure */
-#define ZERO_STRUCT(x) memset((char *) & (x), 0, sizeof(x))
+#define ZERO_STRUCT(x) memset((char *)&(x), 0, sizeof(x))
 
 /** Zero a structure given a pointer to the structure */
 #define ZERO_STRUCTP(x)                                        \
